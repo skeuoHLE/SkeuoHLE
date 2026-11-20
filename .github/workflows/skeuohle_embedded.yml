@@ -1,0 +1,61 @@
+name: SkeuoHLE embedded
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "platform/android/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/skeuohle_embedded.yml"
+      - "LICENSE"
+      - "NOTICE"
+      - "LICENSING.md"
+      - "dev-scripts/collect-licenses.py"
+      - "dev-scripts/licenses/**"
+
+jobs:
+  arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - name: Boost headers
+        run: |
+          curl -L --retry 3 -o /tmp/boost.tar.gz https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz
+          mkdir -p vendor
+          tar -xzf /tmp/boost.tar.gz -C vendor
+          mv vendor/boost_1_85_0 vendor/boost
+      - name: Build libskeuohle_core.so
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CC_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CXX_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
+          AR_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+        run: cargo build -p skeuohle_embed --release --target aarch64-linux-android
+      - name: Package license and source notices
+        run: |
+          mkdir -p dist/skeuohle-core
+          cp target/aarch64-linux-android/release/libskeuohle_core.so dist/skeuohle-core/
+          # OpenAL Soft (LGPL) ships as its own replaceable library.
+          cp target/aarch64-linux-android/release/libopenal.so dist/skeuohle-core/
+          cp vendor/openal-soft/COPYING dist/skeuohle-core/COPYING.openal-soft
+          cp LICENSE NOTICE LICENSING.md dist/skeuohle-core/
+          python3 dev-scripts/collect-licenses.py dist/skeuohle-core/THIRD_PARTY_NOTICES.txt
+          printf 'https://github.com/%s/tree/%s\n' "$GITHUB_REPOSITORY" "$GITHUB_SHA" > dist/skeuohle-core/SOURCE.txt
+          git submodule status --recursive >> dist/skeuohle-core/SOURCE.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libskeuohle_core-arm64
+          path: dist/skeuohle-core/

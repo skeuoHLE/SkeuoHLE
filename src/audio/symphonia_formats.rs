@@ -1,0 +1,377 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.
+ * If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! Quick-and-dirty decoding of miscellaneous formats (MP3, AAC, CAF) to linear
+//! PCM.
+//!
+//! This should be the only module in touchHLE that makes use of [symphonia].
+//!
+//! Note on the Symphonia 0.6 API (which differs substantially from 0.5):
+//!
+//! - [`symphonia::default::get_probe`]'s `probe()` returns the
+//!   [`symphonia::core::formats::FormatReader`] directly (boxed), not a
+//!   `ProbeResult` with a `format` field.
+//! - [`symphonia::core::formats::probe::Hint`] is the probe hint type.
+//! - [`symphonia::core::formats::Track::codec_params`] is
+//!   `Option<CodecParameters>`, where [`CodecParameters`] is an enum whose
+//!   `Audio` variant carries [`AudioCodecParameters`].
+//! - Decoders are created with
+//!   [`symphonia::core::codecs::registry::CodecRegistry::make_audio_decoder`],
+//!   taking `&AudioCodecParameters` and [`AudioDecoderOptions`].
+//! - `FormatReader::next_packet()` returns `Result<Option<Packet>>`; `Ok(None)`
+//!   signals the end of the stream.
+//! - Decoded audio is a [`GenericAudioBufferRef`], which exposes
+//!   `copy_bytes_to_vec_interleaved_as::<i16>()` to produce interleaved
+//!   little-endian 16-bit PCM bytes directly.
+//! - The signal specification type is [`AudioSpec`] (with `rate()` and
+//!   `channels()` accessors), replacing 0.5's `SignalSpec`.
+
+use std::io::Cursor;
+use symphonia::core::audio::{Channels, Position};
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_MP3};
+use symphonia::core::codecs::audio::{
+    AudioCodecParameters, AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO,
+};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::packet::PacketRef;
+use symphonia::core::units::{Duration, Timestamp};
+
+/// PCM data decoded from a miscellaneous format file.
+pub struct SymphoniaDecodedToPcm {
+    /// 16-bit little-endian PCM samples, grouped in frames (one sample per
+    /// channel in each frame).
+    pub bytes: Vec<u8>,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Channel count.
+    pub channels: u32,
+}
+
+pub fn decode_symphonia_to_pcm(file: Cursor<Vec<u8>>) -> Result<SymphoniaDecodedToPcm, ()> {
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let hint = Hint::new();
+    let fmt_opts = FormatOptions::default();
+    let meta_opts = MetadataOptions::default();
+
+    // In Symphonia 0.6, `probe()` returns the boxed `FormatReader` directly.
+    let mut format = match symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts) {
+        Ok(reader) => reader,
+        Err(e) => {
+            log!("Symphonia probe failed: {:?}", e);
+            return Err(());
+        }
+    };
+
+    // Find the first audio track with a known codec. `codec_params` is an
+    // `Option<CodecParameters>`; we want the `Audio` variant with a non-null
+    // codec ID.
+    let track = match format.tracks().iter().find(|t| {
+        matches!(
+            &t.codec_params,
+            Some(CodecParameters::Audio(a)) if a.codec != CODEC_ID_NULL_AUDIO
+        )
+    }) {
+        Some(t) => t,
+        None => {
+            log!("Symphonia: no supported audio tracks found in file");
+            return Err(());
+        }
+    };
+
+    let track_id = track.id;
+    // Clone the audio codec parameters so we don't keep a borrow on `format`.
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(a)) => a.clone(),
+        // Unreachable: the `find` above already guaranteed the audio variant.
+        _ => {
+            log!("Symphonia: selected track is not an audio track");
+            return Err(());
+        }
+    };
+
+    // Create the decoder via `get_codecs().make_audio_decoder(...)`.
+    let dec_opts = AudioDecoderOptions::default();
+    let mut decoder =
+        match symphonia::default::get_codecs().make_audio_decoder(&audio_params, &dec_opts) {
+            Ok(d) => d,
+            Err(e) => {
+                log!("Symphonia failed to create decoder: {:?}", e);
+                return Err(());
+            }
+        };
+
+    let mut out_pcm = Vec::<u8>::new();
+    // Reused scratch buffer for the interleaved bytes of each decoded packet.
+    let mut packet_bytes = Vec::<u8>::new();
+    let mut out_rate: Option<u32> = None;
+    let mut out_channels: Option<usize> = None;
+
+    loop {
+        // `next_packet()` returns `Ok(None)` at the end of the stream. An
+        // `IoError` is also treated as a normal end-of-stream.
+        let packet = match format.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(SymphoniaError::IoError(_)) => break,
+            // Chained OGG and similar formats — just stop here.
+            Err(SymphoniaError::ResetRequired) => break,
+            Err(e) => {
+                log!("Symphonia packet read error: {:?} (stopping decode)", e);
+                break;
+            }
+        };
+
+        if packet.track_id != track_id {
+            continue;
+        }
+
+        // Symphonia has had panics on unusual-but-valid AAC streams (e.g. an
+        // out-of-bounds scalefactor band index in its section-data parser).
+        // Catch any such panic so a malformed file can't take down the whole
+        // emulator: the packet is dropped and decoding continues.
+        let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode(&packet).map(|decoded| {
+                // Remember the signal spec from the first successfully decoded
+                // packet, then convert this packet's samples to interleaved
+                // little-endian i16 bytes. Everything must happen inside the
+                // closure because the decoded buffer borrows the decoder.
+                let spec = decoded.spec();
+                let spec_pair = (spec.rate(), spec.channels().count());
+                decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut packet_bytes);
+                spec_pair
+            })
+        }));
+
+        let (rate, channels) = match decode_result {
+            Ok(Ok(pair)) => {
+                out_pcm.extend_from_slice(&packet_bytes);
+                pair
+            }
+            Ok(Err(SymphoniaError::DecodeError(e))) => {
+                // Corrupt frame — skip it and keep going.
+                log!("Symphonia decode error (recoverable): {:?}", e);
+                continue;
+            }
+            Ok(Err(e)) => {
+                log!("Symphonia fatal decode error: {:?}", e);
+                break;
+            }
+            Err(_) => {
+                // The decoder's internal state can't be trusted after a panic,
+                // so there's no point in trying to decode further packets.
+                log!("Symphonia decoder panicked (skipping rest of stream)");
+                break;
+            }
+        };
+
+        if out_rate.is_none() {
+            out_rate = Some(rate);
+            out_channels = Some(channels);
+        }
+    }
+
+    let (sample_rate, channels) = match (out_rate, out_channels) {
+        (Some(rate), Some(channels)) => (rate, channels),
+        _ => {
+            log!("Symphonia: file yielded no valid audio data");
+            return Err(());
+        }
+    };
+
+    if out_pcm.is_empty() {
+        log!("Symphonia: decoded PCM buffer is empty");
+        return Err(());
+    }
+
+    Ok(SymphoniaDecodedToPcm {
+        bytes: out_pcm,
+        sample_rate,
+        channels: channels.try_into().unwrap(),
+    })
+}
+
+/// MP3 or AAC decoder fed one frame at a time, keeping its state between
+/// frames.
+///
+/// Layer III frames borrow bits from the frames before them (the "bit
+/// reservoir"), and AAC frames overlap-add with the previous frame's MDCT
+/// output, so a stream that arrives a frame or two at a time, like the packets
+/// an app enqueues on an `AudioQueue`, can't be decoded by starting afresh for
+/// each chunk.
+pub struct FrameDecoder {
+    decoder: Box<dyn AudioDecoder>,
+    packet_bytes: Vec<u8>,
+}
+
+impl FrameDecoder {
+    pub fn new_mp3() -> Option<Self> {
+        let mut params = AudioCodecParameters::new();
+        params.for_codec(CODEC_ID_MP3);
+        Self::with_params(&params, "MP3")
+    }
+
+    /// AAC-LC decoder for raw access units (no ADTS header) of a stream with
+    /// the given sample rate and channel count.
+    pub fn new_aac(sample_rate: u32, channels: u32) -> Option<Self> {
+        let channels = match channels {
+            1 => Position::FRONT_CENTER,
+            2 => Position::FRONT_LEFT | Position::FRONT_RIGHT,
+            _ => {
+                log!("AAC: unsupported channel count {}", channels);
+                return None;
+            }
+        };
+        let mut params = AudioCodecParameters::new();
+        params
+            .for_codec(CODEC_ID_AAC)
+            .with_sample_rate(sample_rate)
+            .with_channels(Channels::Positioned(channels));
+        Self::with_params(&params, "AAC")
+    }
+
+    fn with_params(params: &AudioCodecParameters, name: &str) -> Option<Self> {
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
+            .map_err(|e| log!("Symphonia failed to create {} decoder: {:?}", name, e))
+            .ok()?;
+        Some(FrameDecoder {
+            decoder,
+            packet_bytes: Vec::new(),
+        })
+    }
+
+    /// Decodes a single frame (an MPEG audio frame with its header, or a raw
+    /// AAC access unit) to 16-bit little-endian interleaved PCM. Returns the
+    /// PCM with its sample rate and channel count, or [None] if the frame
+    /// couldn't be decoded, which is normal for the first frames after a
+    /// discontinuity.
+    pub fn decode_frame(&mut self, frame: &[u8]) -> Option<(&[u8], u32, u32)> {
+        let packet = PacketRef::new(0, Timestamp::new(0), Duration::new(0), frame);
+        let decoder = &mut self.decoder;
+        let packet_bytes = &mut self.packet_bytes;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode_ref(&packet).map(|decoded| {
+                let spec = decoded.spec();
+                let spec_pair = (spec.rate(), spec.channels().count());
+                decoded.copy_bytes_to_vec_interleaved_as::<i16>(packet_bytes);
+                spec_pair
+            })
+        }));
+        match result {
+            Ok(Ok((rate, channels))) => Some((&self.packet_bytes, rate, channels as u32)),
+            Ok(Err(e)) => {
+                log_dbg!("Audio frame could not be decoded: {:?}", e);
+                None
+            }
+            Err(_) => {
+                log!("Symphonia frame decoder panicked; resetting it");
+                self.decoder.reset();
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod quicktime_pcm_tests {
+    use super::*;
+
+    fn atom(kind: &[u8; 4], data: Vec<u8>) -> Vec<u8> {
+        [
+            ((data.len() + 8) as u32).to_be_bytes().as_slice(),
+            kind,
+            &data,
+        ]
+        .concat()
+    }
+
+    fn words(values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_be_bytes())
+            .collect()
+    }
+
+    // Authored PCM-only QuickTime movie, with two chunks separated by unrelated
+    // media bytes. No game assets are used. QuickTime v0/v1 sample conventions:
+    // https://developer.apple.com/documentation/quicktime-file-format/sound_sample_description_version_1
+    fn movie(version: u16, sample_size: u32) -> (Vec<u8>, Vec<u8>) {
+        let pcm: Vec<u8> = [1000i16, -1000, 2000, -2000, 3000, -3000, 4000, -4000]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let ftyp = atom(b"ftyp", [b"qt  ".as_slice(), &[0; 4], b"qt  "].concat());
+        let first_chunk = (ftyp.len() + 8) as u32;
+        let mdat = atom(b"mdat", [&pcm[..8], &[0x55; 12], &pcm[8..]].concat());
+        let mut sound = vec![0; 6];
+        sound.extend_from_slice(&1u16.to_be_bytes()); // data reference
+        sound.extend_from_slice(&version.to_be_bytes());
+        sound.extend_from_slice(&0u16.to_be_bytes()); // revision
+        sound.extend_from_slice(&0u32.to_be_bytes()); // vendor
+        sound.extend_from_slice(&2u16.to_be_bytes()); // stereo
+        sound.extend_from_slice(&16u16.to_be_bytes());
+        let compression_id = if version == 1 { u16::MAX } else { 0 };
+        sound.extend_from_slice(&compression_id.to_be_bytes());
+        sound.extend_from_slice(&0u16.to_be_bytes()); // packet size
+        sound.extend_from_slice(&(48000u32 << 16).to_be_bytes());
+        if version == 1 {
+            sound.extend_from_slice(&words(&[1, 2, 4, 2]));
+        }
+        let stsd = atom(b"stsd", [words(&[0, 1]), atom(b"sowt", sound)].concat());
+        let stbl = atom(
+            b"stbl",
+            [
+                stsd,
+                atom(b"stts", words(&[0, 1, 4, 1])),
+                atom(b"stsc", words(&[0, 1, 1, 2, 1])),
+                atom(b"stsz", words(&[0, sample_size, 4])),
+                atom(b"stco", words(&[0, 2, first_chunk, first_chunk + 20])),
+            ]
+            .concat(),
+        );
+        let mdhd = atom(b"mdhd", [words(&[0, 0, 0, 48000, 4]), vec![0; 4]].concat());
+        let hdlr = atom(
+            b"hdlr",
+            [words(&[0, 0]), b"soun".to_vec(), vec![0; 13]].concat(),
+        );
+        let minf = atom(b"minf", [atom(b"smhd", vec![0; 8]), stbl].concat());
+        let mdia = atom(b"mdia", [mdhd, hdlr, minf].concat());
+        let tkhd = atom(b"tkhd", [words(&[7, 0, 0, 1, 0, 4]), vec![0; 14]].concat());
+        let mvhd = atom(
+            b"mvhd",
+            [words(&[0, 0, 0, 48000, 4, 65536]), vec![0; 2]].concat(),
+        );
+        let moov = atom(
+            b"moov",
+            [mvhd, atom(b"trak", [tkhd, mdia].concat())].concat(),
+        );
+        ([ftyp, mdat, moov].concat(), pcm)
+    }
+
+    #[test]
+    fn quicktime_v0_and_v1_nominal_byte_samples_decode_complete_stereo_frames() {
+        for version in [0, 1] {
+            let (movie, expected) = movie(version, 1);
+            let decoded = decode_symphonia_to_pcm(Cursor::new(movie)).unwrap();
+            assert_eq!(decoded.sample_rate, 48000);
+            assert_eq!(decoded.channels, 2);
+            assert_eq!(decoded.bytes, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_pcm_frame_sizes_are_not_multiplied_again() {
+        let (movie, expected) = movie(0, 4);
+        let decoded = decode_symphonia_to_pcm(Cursor::new(movie)).unwrap();
+        assert_eq!(decoded.bytes, expected);
+    }
+}

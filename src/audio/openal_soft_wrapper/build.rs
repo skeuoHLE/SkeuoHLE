@@ -1,0 +1,211 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+use std::env;
+use std::path::Path;
+
+/*fn rerun_if_changed(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.to_str().unwrap());
+}*/
+fn link_search(path: &Path) {
+    println!("cargo:rustc-link-search=native={}", path.to_str().unwrap());
+}
+/// The vendored OpenAL Soft is built either way; "shared" only changes how.
+const BUILD_VENDORED: bool = cfg!(feature = "static") || cfg!(feature = "shared");
+const SHARED: bool = cfg!(feature = "shared");
+
+fn link_lib(lib: &str) {
+    if cfg!(feature = "static") && !SHARED {
+        println!("cargo:rustc-link-lib=static={lib}");
+    } else {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+}
+
+fn link_framework(framework: &str) {
+    println!("cargo:rustc-link-lib=framework={framework}");
+}
+
+/// Best-effort check for whether a shared library (e.g. `sndio`) is installed
+/// on the host Linux system, so we only emit a `-l<lib>` flag the linker can
+/// actually satisfy. Checks the common library directories and any paths in
+/// `LD_LIBRARY_PATH`/`LIBRARY_PATH`.
+fn linux_has_lib(lib: &str) -> bool {
+    let filename = format!("lib{lib}.so");
+    let mut dirs: Vec<String> = vec![
+        "/usr/lib".into(),
+        "/usr/lib64".into(),
+        "/usr/lib/x86_64-linux-gnu".into(),
+        "/usr/lib/aarch64-linux-gnu".into(),
+        "/lib".into(),
+        "/lib64".into(),
+        "/usr/local/lib".into(),
+        "/usr/local/lib64".into(),
+    ];
+    for var in ["LD_LIBRARY_PATH", "LIBRARY_PATH"] {
+        if let Ok(val) = env::var(var) {
+            dirs.extend(val.split(':').map(|s| s.to_string()));
+        }
+    }
+    dirs.iter().any(|dir| {
+        let base = Path::new(dir);
+        // Match `libX.so` or any versioned `libX.so.N` in the directory.
+        if base.join(&filename).exists() {
+            return true;
+        }
+        std::fs::read_dir(base)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("{filename}."))
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn define_android_toolchain(build: &mut cmake::Config) {
+    let ndk = env::var_os("ANDROID_NDK_HOME").or_else(|| env::var_os("ANDROID_NDK_ROOT"));
+    let Some(ndk) = ndk else {
+        return;
+    };
+    let toolchain = Path::new(&ndk).join("build/cmake/android.toolchain.cmake");
+    if toolchain.is_file() {
+        build.define("CMAKE_TOOLCHAIN_FILE", toolchain);
+        build.define("ANDROID_ABI", "arm64-v8a");
+        build.define("ANDROID_PLATFORM", "android-21");
+    }
+}
+
+/// Puts libopenal.so next to the final artifact (target/<triple>/<profile>/), where
+/// libskeuohle_core.so is, so the host app can package both from one directory.
+/// OUT_DIR is <that dir>/build/<crate>-<hash>/out, or with newer Cargo
+/// <that dir>/build/<crate>/<hash>/out: take the parent of the nearest `build`.
+fn copy_shared_library_to_target_dir(library: &Path) {
+    let out_dir = std::path::PathBuf::from(env::var("OUT_DIR").unwrap());
+    let Some(profile_dir) = out_dir
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+    else {
+        println!("cargo:warning=Could not find the build output directory above {}", out_dir.display());
+        return;
+    };
+    if let Err(err) = std::fs::copy(library, profile_dir.join("libopenal.so")) {
+        println!(
+            "cargo:warning=Could not copy {} next to the build output: {err}",
+            library.display()
+        );
+    }
+}
+
+fn main() {
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS was not set");
+    if BUILD_VENDORED {
+        let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = package_root.join("../../..");
+
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace_root
+                .join("vendor/openal-soft/alc/backends/opensl.cpp")
+                .display()
+        );
+
+        let mut build = cmake::Config::new(workspace_root.join("vendor/openal-soft"));
+
+        // Prevent any out dir re-use for Android. For some reason, this causes
+        // weird linker errors when cross-compiling on macOS.
+        let out_dir = Path::new(&env::var("OUT_DIR").unwrap()).join(&os);
+        if os.eq_ignore_ascii_case("android") {
+            let _ = std::fs::remove_dir_all(&out_dir);
+        }
+        build.out_dir(out_dir);
+
+        // OpenAL Soft's headers reference `uint8_t` without including
+        // <cstdint>, and newer libstdc++/GCC no longer expose it transitively.
+        // Force the include so the vendored sources build on current distros.
+        if !os.eq_ignore_ascii_case("windows") {
+            build.cxxflag("-include cstdint");
+        }
+
+        build.define("LIBTYPE", if SHARED { "SHARED" } else { "STATIC" });
+        build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+        if os.eq_ignore_ascii_case("android") {
+            define_android_toolchain(&mut build);
+            if SHARED {
+                // One C++ runtime per process: the core already needs
+                // libc++_shared.so, so the separate libopenal.so uses it too.
+                build.define("ANDROID_STL", "c++_shared");
+            }
+        }
+
+        // Don't build extras, we don't need them and they can encounter issues
+        // when cross-compiling.
+        build.define("ALSOFT_UTILS", "OFF");
+        build.define("ALSOFT_NO_CONFIG_UTIL", "ON");
+        build.define("ALSOFT_EXAMPLES", "OFF");
+
+        if os.eq_ignore_ascii_case("linux") {
+            // Make Linux release builds actually include normal desktop audio.
+            // Without these, OpenAL Soft can silently build with only sndio/oss/null/wave,
+            // which makes Pulse/ALSA impossible to use at runtime.
+            build.define("ALSOFT_BACKEND_PULSEAUDIO", "ON");
+            build.define("ALSOFT_BACKEND_ALSA", "ON");
+
+            // Fail the build if the common Linux audio backends are missing,
+            // instead of producing a no-sound binary.
+            build.define("ALSOFT_REQUIRE_PULSEAUDIO", "ON");
+            build.define("ALSOFT_REQUIRE_ALSA", "ON");
+        }
+
+        let openal_soft_out = build.build();
+
+        link_search(&openal_soft_out.join("lib"));
+        // some Linux systems
+        link_search(&openal_soft_out.join("lib64"));
+
+        // Some dependencies of OpenAL Soft.
+        if os.eq_ignore_ascii_case("linux") {
+            // Linux OpenAL Soft backend dependencies for static OpenAL builds.
+            // PulseAudio and ALSA are required above (ALSOFT_REQUIRE_*), so
+            // they are always linked.
+            println!("cargo:rustc-link-lib=dylib=pulse");
+            println!("cargo:rustc-link-lib=dylib=asound");
+
+            // sndio is optional: OpenAL Soft only builds its sndio backend when
+            // the library is present at configure time. Unconditionally
+            // emitting `-lsndio` breaks the final link on the many Linux
+            // distributions that don't ship it (e.g. Amazon Linux, RHEL).
+            // Only request it when we can actually find the shared object.
+            if linux_has_lib("sndio") {
+                println!("cargo:rustc-link-lib=dylib=sndio");
+            }
+        }
+        if os.eq_ignore_ascii_case("android") {
+            if SHARED {
+                copy_shared_library_to_target_dir(&openal_soft_out.join("lib/libopenal.so"));
+            } else {
+                // A shared libopenal.so links OpenSL ES itself.
+                println!("cargo:rustc-link-lib=dylib=OpenSLES");
+            }
+        }
+        if os.eq_ignore_ascii_case("macos") {
+            link_framework("AudioToolbox");
+            link_framework("CoreAudio");
+            link_framework("CoreFoundation");
+        }
+    }
+
+    // see also src/audio/openal.rs
+    link_lib(if os.eq_ignore_ascii_case("windows") {
+        "OpenAL32"
+    } else {
+        "openal"
+    });
+    // rerun-if-changed seems to not work if pointed to a directory :(
+    //rerun_if_changed(&workspace_root.join("vendor/openal-soft"));
+}

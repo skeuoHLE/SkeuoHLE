@@ -1,0 +1,23 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+[package]
+name = "touchHLE_openal_soft_wrapper"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+
+[lib]
+path = "lib.rs"
+
+[build-dependencies]
+cmake = { workspace = true }
+
+[features]
+# Build the vendored OpenAL Soft and link it statically into the core.
+static = []
+# Build the vendored OpenAL Soft as its own shared library (libopenal.so) and link
+# the core against it dynamically. The embedded Android core uses this so a closed
+# host app ships OpenAL Soft (LGPL) as a separate, replaceable library.
+shared = []

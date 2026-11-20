@@ -1,0 +1,779 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.
+ * If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! `CGBitmapContext.h`
+
+use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
+use super::cg_color_space::{
+    kCGColorSpaceGenericCMYK, kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB,
+    kCGColorSpaceModelCMYK, kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB,
+    CGColorSpaceHostObject, CGColorSpaceRef,
+};
+use super::cg_context::{CGContextHostObject, CGContextRef, CGContextSubclass};
+use super::cg_image::{
+    self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
+    kCGImageAlphaNone, kCGImageAlphaNoneSkipFirst, kCGImageAlphaNoneSkipLast, kCGImageAlphaOnly,
+    kCGImageAlphaPremultipliedFirst, kCGImageAlphaPremultipliedLast, kCGImageByteOrder16Big,
+    kCGImageByteOrder16Little, kCGImageByteOrder32Big, kCGImageByteOrder32Little,
+    kCGImageByteOrderDefault, CGBitmapInfo, CGImageAlphaInfo, CGImageRef,
+};
+use super::{CGFloat, CGPoint, CGRect};
+use crate::dyld::{export_c_func, FunctionExports};
+use crate::image::{gamma_decode, gamma_encode, Image};
+use crate::mem::{GuestUSize, Mem, MutVoidPtr};
+use crate::objc::ObjC;
+use crate::Environment;
+
+#[derive(Copy, Clone, Default)]
+pub(super) struct CGBitmapContextData {
+    pub(super) data: MutVoidPtr,
+    pub(super) data_is_owned: bool,
+    width: GuestUSize,
+    height: GuestUSize,
+    bits_per_component: GuestUSize,
+    bytes_per_row: GuestUSize,
+    color_space: &'static str,
+    alpha_info: CGImageAlphaInfo,
+    /// `bitmap_info & kCGBitmapByteOrderMask`.
+    byte_order: CGBitmapInfo,
+}
+
+pub fn CGBitmapContextCreate(
+    env: &mut Environment,
+    data: MutVoidPtr,
+    width: GuestUSize,
+    height: GuestUSize,
+    bits_per_component: GuestUSize,
+    bytes_per_row: GuestUSize,
+    color_space: CGColorSpaceRef,
+    bitmap_info: u32,
+) -> CGContextRef {
+    let color_space_name = if color_space.is_null() {
+        kCGColorSpaceGenericRGB
+    } else {
+        env.objc.borrow::<CGColorSpaceHostObject>(color_space).name
+    };
+
+    let component_count = match color_space_name {
+        kCGColorSpaceGenericRGB => components_for_rgb(bitmap_info).unwrap_or(4),
+        kCGColorSpaceGenericGray => components_for_gray(bitmap_info).unwrap_or(1),
+        _ => {
+            log!(
+                "Warning: unknown color space '{}' in CGBitmapContextCreate, falling back to RGB",
+                color_space_name
+            );
+            components_for_rgb(bitmap_info).unwrap_or(4)
+        }
+    };
+
+    let color_space = color_space_name;
+
+    let (data, data_is_owned, bytes_per_row) = if data.is_null() {
+        let bytes_per_row = if bytes_per_row == 0 {
+            let bytes_per_pixel = if bits_per_component == 5 {
+                2
+            } else {
+                component_count
+            };
+            width.checked_mul(bytes_per_pixel).unwrap()
+        } else {
+            bytes_per_row
+        };
+        let total_size = bytes_per_row.checked_mul(height).unwrap();
+        let data = env.mem.alloc(total_size);
+        env.mem.bytes_at_mut(data.cast(), total_size).fill(0);
+        (data, true, bytes_per_row)
+    } else {
+        (data, false, bytes_per_row)
+    };
+
+    let host_object = CGContextHostObject {
+        subclass: CGContextSubclass::CGBitmapContext(CGBitmapContextData {
+            data,
+            data_is_owned,
+            width,
+            height,
+            bits_per_component,
+            bytes_per_row,
+            color_space,
+            alpha_info: bitmap_info & kCGBitmapAlphaInfoMask,
+            byte_order: bitmap_info & kCGBitmapByteOrderMask,
+        }),
+        transform: CGAffineTransformIdentity,
+        text_transform: None,
+        rgb_fill_color: (0.0, 0.0, 0.0, 1.0),
+        fill_color_space_model: match color_space_name {
+            kCGColorSpaceGenericGray => kCGColorSpaceModelMonochrome,
+            kCGColorSpaceGenericCMYK => kCGColorSpaceModelCMYK,
+            _ => kCGColorSpaceModelRGB,
+        },
+        rgb_stroke_color: (0.0, 0.0, 0.0, 1.0),
+        alpha: 1.0,
+        line_width: 1.0,
+        line_cap: 0,
+        line_join: 0,
+        miter_limit: 10.0,
+        flatness: 0.0,
+        blend_mode: 0,
+        interpolation_quality: 2,
+        // Quartz's default font state.
+        font: crate::mem::Ptr::null(),
+        font_size: 17.0,
+        state_stack: Vec::new(),
+        path_elements: Vec::new(),
+        // Apple defaults: rendering intent unspecified = `kCGRenderingIntentDefault` (0).
+        rendering_intent: 0,
+        shadow: crate::frameworks::core_graphics::cg_context::CGShadowState::default(),
+    };
+
+    let isa = env
+        .objc
+        .get_known_class("_touchHLE_CGContext", &mut env.mem);
+    env.objc
+        .alloc_object(isa, Box::new(host_object), &mut env.mem)
+}
+
+pub fn CGBitmapContextGetData(env: &mut Environment, context: CGContextRef) -> MutVoidPtr {
+    let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+    bitmap_data.data
+}
+
+pub fn CGBitmapContextGetWidth(env: &mut Environment, context: CGContextRef) -> GuestUSize {
+    let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+    bitmap_data.width
+}
+
+pub fn CGBitmapContextGetHeight(env: &mut Environment, context: CGContextRef) -> GuestUSize {
+    let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+    bitmap_data.height
+}
+
+fn CGBitmapContextGetBytesPerRow(env: &mut Environment, context: CGContextRef) -> GuestUSize {
+    let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+    bitmap_data.bytes_per_row
+}
+
+pub fn CGBitmapContextCreateImage(env: &mut Environment, context: CGContextRef) -> CGImageRef {
+    let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+
+    if !matches!(bitmap_data.bits_per_component, 5 | 8) {
+        log!("Warning: CGBitmapContextCreateImage called with bits_per_component = {}, which is not fully supported yet.", bitmap_data.bits_per_component);
+    }
+
+    let bpp = bytes_per_pixel(&bitmap_data) as usize;
+    let data_size = bitmap_data.bytes_per_row * bitmap_data.height;
+
+    let raw_pixels = env.mem.bytes_at(bitmap_data.data.cast(), data_size);
+
+    let mut normalized_pixels =
+        Vec::with_capacity((bitmap_data.width * bitmap_data.height * 4) as usize);
+
+    let (r_offset, g_offset, b_offset, a_offset) = pixel_offsets(&bitmap_data);
+
+    for y in 0..bitmap_data.height {
+        let row_start = (y * bitmap_data.bytes_per_row) as usize;
+        for x in 0..bitmap_data.width {
+            let pixel_start = row_start + (x as usize * bpp);
+
+            if pixel_start + bpp > raw_pixels.len() {
+                normalized_pixels.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+
+            if is_rgb555(&bitmap_data) {
+                let (r, g, b) = read_rgb555(&bitmap_data, raw_pixels, pixel_start);
+                normalized_pixels.extend_from_slice(&[r, g, b, 255]);
+                continue;
+            }
+
+            let r = raw_pixels.get(pixel_start + r_offset).copied().unwrap_or(0);
+            let g = raw_pixels.get(pixel_start + g_offset).copied().unwrap_or(0);
+            let b = raw_pixels.get(pixel_start + b_offset).copied().unwrap_or(0);
+
+            let a = if let Some(offset) = a_offset {
+                raw_pixels.get(pixel_start + offset).copied().unwrap_or(255)
+            } else {
+                255
+            };
+
+            // Image owns RGBA8 with premultiplied alpha, including when the
+            // source bitmap context uses straight alpha.
+            let factor = if matches!(bitmap_data.alpha_info, kCGImageAlphaLast | kCGImageAlphaFirst) {
+                a as f32 / 255.0
+            } else { 1.0 };
+            normalized_pixels.push((r as f32 * factor).round() as u8);
+            normalized_pixels.push((g as f32 * factor).round() as u8);
+            normalized_pixels.push((b as f32 * factor).round() as u8);
+            normalized_pixels.push(a);
+        }
+    }
+
+    let image = Image::from_pixel_vec(normalized_pixels, (bitmap_data.width, bitmap_data.height));
+    if is_rgb555(&bitmap_data) {
+        cg_image::from_rgb555_image(env, image)
+    } else {
+        cg_image::from_image(env, image)
+    }
+}
+
+fn components_for_rgb(bitmap_info: CGBitmapInfo) -> Result<GuestUSize, ()> {
+    let byte_order = bitmap_info & kCGBitmapByteOrderMask;
+    if !matches!(
+        byte_order,
+        kCGImageByteOrderDefault | kCGImageByteOrder32Big | kCGImageByteOrder32Little
+    ) {
+        return Err(());
+    }
+
+    let alpha_info = bitmap_info & kCGBitmapAlphaInfoMask;
+    if (alpha_info | byte_order) != bitmap_info {
+        return Err(());
+    }
+    match alpha_info & kCGBitmapAlphaInfoMask {
+        kCGImageAlphaNone => Ok(3),
+        kCGImageAlphaPremultipliedLast
+        | kCGImageAlphaPremultipliedFirst
+        | kCGImageAlphaLast
+        | kCGImageAlphaFirst
+        | kCGImageAlphaNoneSkipLast
+        | kCGImageAlphaNoneSkipFirst => Ok(4),
+        kCGImageAlphaOnly => Ok(1),
+        _ => Err(()),
+    }
+}
+
+fn components_for_gray(bitmap_info: CGBitmapInfo) -> Result<GuestUSize, ()> {
+    let byte_order = bitmap_info & kCGBitmapByteOrderMask;
+    if !matches!(
+        byte_order,
+        kCGImageByteOrderDefault
+            | kCGImageByteOrder32Big
+            | kCGImageByteOrder16Big
+            | kCGImageByteOrder16Little
+    ) {
+        return Err(());
+    }
+
+    let alpha_info = bitmap_info & kCGBitmapAlphaInfoMask;
+    if (alpha_info | byte_order) != bitmap_info {
+        return Err(());
+    }
+    match alpha_info & kCGBitmapAlphaInfoMask {
+        kCGImageAlphaNone => Ok(1),
+        kCGImageAlphaPremultipliedLast
+        | kCGImageAlphaPremultipliedFirst
+        | kCGImageAlphaLast
+        | kCGImageAlphaFirst
+        | kCGImageAlphaNoneSkipLast
+        | kCGImageAlphaNoneSkipFirst => Ok(2),
+        kCGImageAlphaOnly => Ok(1),
+        _ => Err(()),
+    }
+}
+
+fn bytes_per_pixel(data: &CGBitmapContextData) -> GuestUSize {
+    let &CGBitmapContextData {
+        bits_per_component,
+        color_space,
+        alpha_info,
+        ..
+    } = data;
+    if is_rgb555(data) {
+        return 2;
+    }
+    if bits_per_component != 8 {
+        // We don't currently support 16-bit-per-component or float bitmap
+        // contexts. Clamp to the 8-bit interpretation so callers don't crash
+        // outright; rendering may look wrong but the host stays alive.
+        log!(
+            "Warning: CGBitmapContext: unsupported bitsPerComponent {} (expected 8); \
+             treating as 8.",
+            bits_per_component
+        );
+    }
+    match color_space {
+        kCGColorSpaceGenericRGB => components_for_rgb(alpha_info).unwrap_or(4),
+        kCGColorSpaceGenericGray => components_for_gray(alpha_info).unwrap_or(1),
+        _ => components_for_rgb(alpha_info).unwrap_or(4),
+    }
+}
+
+/// Whether this is the 16-bit RGB layout: 5 bits per component in a 16-bit
+/// word whose top bit is unused (`kCGImageAlphaNoneSkipFirst`). It is the
+/// only bits-per-component other than 8 that iPhone OS bitmap contexts
+/// support. DoDonPachi Resurrection wraps its 16-bit texture data in one.
+fn is_rgb555(data: &CGBitmapContextData) -> bool {
+    data.bits_per_component == 5
+}
+
+fn rgb555_word_to_bytes(data: &CGBitmapContextData, word: u16) -> [u8; 2] {
+    if data.byte_order == kCGImageByteOrder16Little {
+        word.to_le_bytes()
+    } else {
+        word.to_be_bytes()
+    }
+}
+
+/// Read the pixel at byte offset `idx` as 8-bit components.
+fn read_rgb555(data: &CGBitmapContextData, pixels: &[u8], idx: usize) -> (u8, u8, u8) {
+    let bytes = [pixels[idx], pixels[idx + 1]];
+    let word = if data.byte_order == kCGImageByteOrder16Little {
+        u16::from_le_bytes(bytes)
+    } else {
+        u16::from_be_bytes(bytes)
+    };
+    // Replicate the top bits into the bottom ones so 0x1f becomes 0xff.
+    let expand = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    (
+        expand((word >> 10) & 0x1f),
+        expand((word >> 5) & 0x1f),
+        expand(word & 0x1f),
+    )
+}
+
+/// Write 8-bit components to the pixel at byte offset `idx`.
+fn write_rgb555(data: &CGBitmapContextData, pixels: &mut [u8], idx: usize, rgb: (u8, u8, u8)) {
+    let (r, g, b) = rgb;
+    let word = (u16::from(r) >> 3) << 10 | (u16::from(g) >> 3) << 5 | u16::from(b) >> 3;
+    pixels[idx..idx + 2].copy_from_slice(&rgb555_word_to_bytes(data, word));
+}
+
+fn get_pixels<'a>(data: &CGBitmapContextData, mem: &'a mut Mem) -> &'a mut [u8] {
+    let pixel_data_size = data.height.checked_mul(data.bytes_per_row).unwrap();
+    mem.bytes_at_mut(data.data.cast(), pixel_data_size)
+}
+
+// Storage is sRGB, but compositing uses linear premultiplied RGBA, as in
+// touchHLE. Unpremultiply before the nonlinear gamma conversion, and multiply
+// afterwards; gamma_decode(encoded * alpha) is not gamma_decode(encoded)*alpha.
+fn decode_component(encoded: f32, alpha: f32, premultiplied: bool) -> f32 {
+    if alpha <= 0.0 { return 0.0; }
+    let straight = if premultiplied { encoded / alpha } else { encoded };
+    gamma_decode(straight.clamp(0.0, 1.0)) * alpha
+}
+
+// ИСПРАВЛЕНИЕ: Убраны все `unreachable!()` и `unimplemented!()`
+// Теперь, если игра передает нестандартный формат, мы безопасно откатываемся на
+// RGBA
+fn pixel_offsets(data: &CGBitmapContextData) -> (usize, usize, usize, Option<usize>) {
+    let (r, g, b, a) = big_endian_pixel_offsets(data);
+    // The alpha info names the components in the order of a big-endian pixel
+    // word. A little-endian word stores them the other way round in memory:
+    // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little (what
+    // iOS apps use as "32-bit host order") is BGRA, not ARGB.
+    let last = match (data.byte_order, bytes_per_pixel(data)) {
+        (kCGImageByteOrder32Little, 4) => 3,
+        (kCGImageByteOrder16Little, 2) => 1,
+        _ => return (r, g, b, a),
+    };
+    (last - r, last - g, last - b, a.map(|a| last - a))
+}
+
+fn big_endian_pixel_offsets(data: &CGBitmapContextData) -> (usize, usize, usize, Option<usize>) {
+    if data.color_space == kCGColorSpaceGenericGray {
+        match data.alpha_info {
+            kCGImageAlphaNone => (0, 0, 0, None),
+            kCGImageAlphaPremultipliedLast | kCGImageAlphaLast => (0, 0, 0, Some(1)),
+            kCGImageAlphaPremultipliedFirst | kCGImageAlphaFirst => (1, 1, 1, Some(0)),
+            kCGImageAlphaNoneSkipLast => (0, 0, 0, None),
+            kCGImageAlphaNoneSkipFirst => (1, 1, 1, None),
+            kCGImageAlphaOnly => (0, 0, 0, Some(0)),
+            _ => (0, 0, 0, None), // Безопасный фоллбэк для Gray
+        }
+    } else {
+        // Для kCGColorSpaceGenericRGB и вообще любых неизвестных Color Space
+        match data.alpha_info {
+            kCGImageAlphaNone => (0, 1, 2, None),
+            kCGImageAlphaPremultipliedLast | kCGImageAlphaLast => (0, 1, 2, Some(3)),
+            kCGImageAlphaPremultipliedFirst | kCGImageAlphaFirst => (1, 2, 3, Some(0)),
+            kCGImageAlphaNoneSkipLast => (0, 1, 2, None),
+            kCGImageAlphaNoneSkipFirst => (1, 2, 3, None),
+            kCGImageAlphaOnly => (0, 0, 0, Some(0)),
+            _ => (0, 1, 2, Some(3)), // Безопасный фоллбэк для RGBA
+        }
+    }
+}
+
+fn get_pixel(
+    data: &CGBitmapContextData,
+    pixels: &mut [u8],
+    first_component_idx: usize,
+) -> (f32, f32, f32, f32) {
+    if is_rgb555(data) {
+        let (r, g, b) = read_rgb555(data, pixels, first_component_idx);
+        return (
+            gamma_decode(r as f32 / 255.0),
+            gamma_decode(g as f32 / 255.0),
+            gamma_decode(b as f32 / 255.0),
+            1.0,
+        );
+    }
+    let pixel_offset = pixel_offsets(data);
+    let pixel = (
+        pixels[first_component_idx + pixel_offset.0] as f32 / 255.0,
+        pixels[first_component_idx + pixel_offset.1] as f32 / 255.0,
+        pixels[first_component_idx + pixel_offset.2] as f32 / 255.0,
+        if let Some(alpha_offest) = pixel_offset.3 {
+            pixels[first_component_idx + alpha_offest] as f32 / 255.0
+        } else {
+            1.0
+        },
+    );
+    (
+        decode_component(pixel.0, pixel.3, matches!(data.alpha_info, kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst)),
+        decode_component(pixel.1, pixel.3, matches!(data.alpha_info, kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst)),
+        decode_component(pixel.2, pixel.3, matches!(data.alpha_info, kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst)),
+        pixel.3,
+    )
+}
+
+fn put_pixel(
+    data: &CGBitmapContextData,
+    pixels: &mut [u8],
+    coords: (i32, i32),
+    pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
+    blend: bool,
+    blend_mode: i32,
+) {
+    let (x, y) = coords;
+    if x < 0 || y < 0 {
+        return;
+    }
+    let (x, y) = (x as GuestUSize, y as GuestUSize);
+    if x >= data.width || y >= data.height {
+        return;
+    }
+
+    let y = data.height - 1 - y;
+    let pixel_size = bytes_per_pixel(data);
+    let first_component_idx = (y * data.bytes_per_row + x * pixel_size) as usize;
+
+    let bg_pixel = get_pixel(data, pixels, first_component_idx);
+    let (r, g, b, a) = if blend {
+        super::bitmap_blend::composite(bg_pixel, pixel, blend_mode)
+    } else {
+        pixel
+    };
+    let a = a.clamp(0.0, 1.0);
+    let factor = if matches!(data.alpha_info, kCGImageAlphaLast | kCGImageAlphaFirst) { 1.0 } else { a };
+    let encode = |v: f32| if a > 0.0 { gamma_encode((v / a).clamp(0.0, 1.0)) * factor } else { 0.0 };
+    let (r, g, b) = (encode(r), encode(g), encode(b));
+    if is_rgb555(data) {
+        let rgb = ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+        write_rgb555(data, pixels, first_component_idx, rgb);
+        return;
+    }
+    let pixel_offset = pixel_offsets(data);
+    match data.alpha_info {
+        kCGImageAlphaOnly => {
+            pixels[first_component_idx] = (a * 255.0) as u8;
+        }
+        _ => {
+            pixels[first_component_idx + pixel_offset.0] = (r * 255.0) as u8;
+            pixels[first_component_idx + pixel_offset.1] = (g * 255.0) as u8;
+            pixels[first_component_idx + pixel_offset.2] = (b * 255.0) as u8;
+            if let Some(alpha_offset) = pixel_offset.3 {
+                pixels[first_component_idx + alpha_offset] = (a * 255.0) as u8;
+            }
+        }
+    }
+}
+
+pub struct CGBitmapContextDrawer<'a> {
+    bitmap_info: CGBitmapContextData,
+    rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    alpha: CGFloat,
+    blend_mode: i32,
+    transform: CGAffineTransform,
+    pixels: &'a mut [u8],
+}
+impl CGBitmapContextDrawer<'_> {
+    pub fn new<'a>(
+        objc: &ObjC,
+        mem: &'a mut Mem,
+        context: CGContextRef,
+    ) -> CGBitmapContextDrawer<'a> {
+        let &CGContextHostObject {
+            subclass: CGContextSubclass::CGBitmapContext(bitmap_info),
+            rgb_fill_color,
+            alpha,
+            blend_mode,
+            transform,
+            ..
+        } = objc.borrow(context);
+        let pixels = get_pixels(&bitmap_info, mem);
+
+        CGBitmapContextDrawer {
+            bitmap_info,
+            rgb_fill_color,
+            alpha,
+            blend_mode,
+            transform,
+            pixels,
+        }
+    }
+
+    pub fn width(&self) -> GuestUSize {
+        self.bitmap_info.width
+    }
+    pub fn height(&self) -> GuestUSize {
+        self.bitmap_info.height
+    }
+    pub fn rgb_fill_color(&self) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+        let a = self.rgb_fill_color.3.clamp(0.0, 1.0);
+        (
+            gamma_decode(self.rgb_fill_color.0) * a,
+            gamma_decode(self.rgb_fill_color.1) * a,
+            gamma_decode(self.rgb_fill_color.2) * a,
+            a,
+        )
+    }
+    pub fn put_pixel(
+        &mut self,
+        coords: (i32, i32),
+        color: (CGFloat, CGFloat, CGFloat, CGFloat),
+        blend: bool,
+    ) {
+        // Apple's global alpha multiplies the paint/image alpha. Apply it
+        // once here for every primitive. ClearRect bypasses painting state.
+        // https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/drawingwithquartz2d/dq_color/dq_color.html
+        let (r, g, b, a) = color;
+        let alpha = if blend { self.alpha } else { 1.0 };
+        put_pixel(&self.bitmap_info, self.pixels, coords,
+            (r * alpha, g * alpha, b * alpha, a * alpha), blend, self.blend_mode)
+    }
+
+    /// Convert a straight sRGB source into the representation used by this
+    /// bitmap's existing pixel blender, just as rgb_fill_color does.
+    pub(super) fn put_srgba_pixel(
+        &mut self,
+        coords: (i32, i32),
+        color: (CGFloat, CGFloat, CGFloat, CGFloat),
+        blend: bool,
+    ) {
+        let (r, g, b, a) = color;
+        let a = a.clamp(0.0, 1.0);
+        self.put_pixel(coords, (
+            gamma_decode(r.clamp(0.0, 1.0)) * a,
+            gamma_decode(g.clamp(0.0, 1.0)) * a,
+            gamma_decode(b.clamp(0.0, 1.0)) * a,
+            a,
+        ), blend);
+    }
+
+    pub fn iter_transformed_pixels(
+        &self,
+        untransformed_rect: CGRect,
+    ) -> impl Iterator<Item = ((i32, i32), (f32, f32))> {
+        let bounding_rect = self.transform.apply_to_rect(untransformed_rect);
+        let x_start = bounding_rect.origin.x.round().max(0.0) as GuestUSize;
+        let y_start = bounding_rect.origin.y.round().max(0.0) as GuestUSize;
+        let x_end = (bounding_rect.origin.x + bounding_rect.size.width)
+            .round()
+            .min(self.width() as f32) as GuestUSize;
+        let y_end = (bounding_rect.origin.y + bounding_rect.size.height)
+            .round()
+            .min(self.height() as f32) as GuestUSize;
+        let inverse_transform = self.transform.invert();
+
+        (y_start..y_end).flat_map(move |y| {
+            (x_start..x_end).flat_map(move |x| {
+                let untransformed = inverse_transform.apply_to_point(CGPoint {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                });
+                let x_within =
+                    (untransformed.x - untransformed_rect.origin.x) / untransformed_rect.size.width;
+                let y_within = (untransformed.y - untransformed_rect.origin.y)
+                    / untransformed_rect.size.height;
+                if !(0.0..1.0).contains(&x_within) || !(0.0..1.0).contains(&y_within) {
+                    None
+                } else {
+                    Some(((x as i32, y as i32), (x_within, y_within)))
+                }
+            })
+        })
+    }
+}
+
+pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRect, clear: bool) {
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    let color = if clear {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        drawer.rgb_fill_color()
+    };
+    for ((x, y), _) in drawer.iter_transformed_pixels(rect) {
+        drawer.put_pixel((x, y), color, !clear)
+    }
+}
+
+pub(super) fn draw_image(
+    env: &mut Environment,
+    context: CGContextRef,
+    rect: CGRect,
+    image: CGImageRef,
+) {
+    let image = cg_image::borrow_image(&env.objc, image);
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+
+    let (image_width, image_height) = image.dimensions();
+    let mut visited = 0usize;
+    let mut src_nonzero = 0usize;
+    for ((x, y), (texel_x, texel_y)) in drawer.iter_transformed_pixels(rect) {
+        let texel_x = (image_width as f32 * texel_x) as i32;
+        let texel_y = (image_height as f32 * (1.0 - texel_y)) as i32;
+        if texel_x >= 0 && texel_x < image_width as i32 && texel_y >= 0 && texel_y < image_height as i32 {
+            let at = (texel_y as usize * image_width as usize + texel_x as usize) * 4;
+            let rgba = &image.pixels()[at..at + 4];
+            let a = rgba[3] as f32 / 255.0;
+            let color = (decode_component(rgba[0] as f32 / 255.0, a, true),
+                         decode_component(rgba[1] as f32 / 255.0, a, true),
+                         decode_component(rgba[2] as f32 / 255.0, a, true), a);
+            visited += 1;
+            if color.3 > 0.0 {
+                src_nonzero += 1;
+            }
+            drawer.put_pixel((x, y), color, true)
+        }
+    }
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            log!(
+                "DRAW-DIAG #{n} ctx={}x{} bpc={} bpr={} alpha={:#x} order={:#x} ctm={:?} rect={:?} image={}x{} visited={} src_alpha_nonzero={}",
+                drawer.bitmap_info.width,
+                drawer.bitmap_info.height,
+                drawer.bitmap_info.bits_per_component,
+                drawer.bitmap_info.bytes_per_row,
+                drawer.bitmap_info.alpha_info,
+                drawer.bitmap_info.byte_order,
+                drawer.transform,
+                rect,
+                image_width,
+                image_height,
+                visited,
+                src_nonzero
+            );
+        }
+    }
+}
+
+#[allow(rustdoc::broken_intra_doc_links)]
+pub fn get_data(objc: &ObjC, context: CGContextRef) -> (GuestUSize, GuestUSize, MutVoidPtr) {
+    let host_obj = objc.borrow::<CGContextHostObject>(context);
+    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+    (bitmap_data.width, bitmap_data.height, bitmap_data.data)
+}
+
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(CGBitmapContextCreate(_, _, _, _, _, _, _)),
+    export_c_func!(CGBitmapContextCreateImage(_)),
+    export_c_func!(CGBitmapContextGetData(_)),
+    export_c_func!(CGBitmapContextGetWidth(_)),
+    export_c_func!(CGBitmapContextGetHeight(_)),
+    export_c_func!(CGBitmapContextGetBytesPerRow(_)),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(color_space: &'static str, bitmap_info: CGBitmapInfo) -> CGBitmapContextData {
+        CGBitmapContextData {
+            width: 1,
+            height: 1,
+            bits_per_component: 8,
+            bytes_per_row: 4,
+            color_space,
+            alpha_info: bitmap_info & kCGBitmapAlphaInfoMask,
+            byte_order: bitmap_info & kCGBitmapByteOrderMask,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rgb_component_offsets_follow_the_byte_order() {
+        let rgb = kCGColorSpaceGenericRGB;
+        // ARGB and RGBA words, stored big-endian.
+        assert_eq!(
+            pixel_offsets(&context(rgb, kCGImageAlphaPremultipliedFirst)),
+            (1, 2, 3, Some(0))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaPremultipliedLast | kCGImageByteOrder32Big
+            )),
+            (0, 1, 2, Some(3))
+        );
+        // The same words stored little-endian: BGRA and ABGR in memory.
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaPremultipliedFirst | kCGImageByteOrder32Little
+            )),
+            (2, 1, 0, Some(3))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaPremultipliedLast | kCGImageByteOrder32Little
+            )),
+            (3, 2, 1, Some(0))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaNoneSkipFirst | kCGImageByteOrder32Little
+            )),
+            (2, 1, 0, None)
+        );
+    }
+
+    #[test]
+    fn gray_alpha_component_offsets_follow_the_byte_order() {
+        let gray = kCGColorSpaceGenericGray;
+        assert_eq!(
+            pixel_offsets(&context(gray, kCGImageAlphaPremultipliedLast)),
+            (0, 0, 0, Some(1))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                gray,
+                kCGImageAlphaPremultipliedLast | kCGImageByteOrder16Little
+            )),
+            (1, 1, 1, Some(0))
+        );
+        // A single component has no byte order to speak of.
+        assert_eq!(
+            pixel_offsets(&context(gray, kCGImageAlphaNone)),
+            (0, 0, 0, None)
+        );
+    }
+
+    #[test]
+    fn little_endian_layouts_have_the_right_pixel_size() {
+        let rgb = kCGColorSpaceGenericRGB;
+        let gray = kCGColorSpaceGenericGray;
+        let bgra = context(
+            rgb,
+            kCGImageAlphaPremultipliedFirst | kCGImageByteOrder32Little,
+        );
+        assert_eq!(bytes_per_pixel(&bgra), 4);
+        let alpha_gray = context(
+            gray,
+            kCGImageAlphaPremultipliedLast | kCGImageByteOrder16Little,
+        );
+        assert_eq!(bytes_per_pixel(&alpha_gray), 2);
+    }
+}

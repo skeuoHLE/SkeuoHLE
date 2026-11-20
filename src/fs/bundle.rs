@@ -1,0 +1,890 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! IPA file format support, allowing it to be used as part of the guest
+//! filesystem.
+use crate::fs::{FsNode, GuestPath};
+use crate::libc::time::{calendar_date_to_timestamp, time_t, tm};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use zip::result::ZipError;
+use zip::ZipArchive;
+
+/// A helper struct to build an FsNode with files and directories coming in
+/// arbitrary order. This is required, because ZIP files are allowed to store
+/// entries in arbitrary order.
+struct FsNodeBuilder {
+    root: FsNode,
+}
+
+impl FsNodeBuilder {
+    fn new() -> Self {
+        Self {
+            root: FsNode::dir(),
+        }
+    }
+
+    fn find_or_make_directory(&mut self, path: &GuestPath) -> &mut FsNode {
+        let mut current = &mut self.root;
+        for part in path.as_str().split('/') {
+            if part.is_empty() {
+                continue;
+            }
+            assert_ne!(part, "..", "unexpected .. in path: {path:?}");
+            let FsNode::Directory { children, .. } = current else {
+                panic!("expected directory, got {current:?}");
+            };
+
+            let next = children.entry(part.to_string()).or_insert_with(FsNode::dir);
+            current = next;
+        }
+        current
+    }
+
+    fn add_file(&mut self, path: &GuestPath, node: FsNode) {
+        let (parent_name, file_name) = path.parent_and_file_name().unwrap();
+        assert_ne!(file_name, "..", "unexpected .. in path: {path:?}");
+        let dir = self.find_or_make_directory(parent_name);
+        let FsNode::Directory { children, .. } = dir else {
+            panic!("expected directory, got {dir:?}");
+        };
+
+        children.insert(file_name.to_string(), node);
+    }
+
+    fn add_directory(&mut self, path: &GuestPath) {
+        self.find_or_make_directory(path);
+    }
+
+    fn build(self) -> FsNode {
+        self.root
+    }
+}
+
+/// Returns the path of a zip entry.
+///
+/// Entries without the zip "UTF-8 filename" flag are supposed to be CP437,
+/// and that is how the `zip` crate decodes them. But many IPAs (zipped on
+/// macOS or by IPA tools) store UTF-8 names without setting the flag. Decoding
+/// those as CP437 garbles any non-ASCII name, e.g. an Arabic app bundle name,
+/// which then no longer matches the `CFBundleExecutable` in the Info.plist and
+/// the executable can't be found. Real CP437 names with non-ASCII characters
+/// are almost never valid UTF-8, so prefer UTF-8 whenever the bytes allow it.
+fn zip_entry_name(file: &zip::read::ZipFile) -> String {
+    match std::str::from_utf8(file.name_raw()) {
+        Ok(name) => name.to_string(),
+        Err(_) => file.name().to_string(),
+    }
+}
+
+/// Represents an open app bundle, either a directory or a zip file.
+pub enum BundleData {
+    HostDirectory(PathBuf),
+    Zip {
+        zip: ZipArchive<std::fs::File>,
+        /// Path to the app bundle inside the zip file.
+        /// It should be `"Payload/<app name>.app"` (no trailing slash!).
+        bundle_path: String,
+    },
+}
+
+impl BundleData {
+    fn find_bundle_path_in_archive(zip: &mut ZipArchive<std::fs::File>) -> Result<String, String> {
+        for i in 0..zip.len() {
+            // Some IPAs found in the wild contain entries whose local file
+            // header is corrupt (even though the central directory is fine).
+            // Skipping such entries is better than rejecting the whole IPA.
+            let path = match zip.by_index(i).map(|file| zip_entry_name(&file)) {
+                Ok(path) => path,
+                Err(e) => {
+                    log!(
+                        "Warning: BundleData::find_bundle_path_in_archive(): skipping unreadable IPA archive entry #{}: {}",
+                        i,
+                        e
+                    );
+                    continue;
+                }
+            };
+            if let Some(name) = path
+                .strip_prefix("Payload/")
+                .and_then(|path| path.split_once('/'))
+                .and_then(|(name, _)| name.strip_suffix(".app"))
+            {
+                return Ok(format!("Payload/{name}.app"));
+            }
+        }
+        Err("no app bundle found in the IPA archive".to_string())
+    }
+
+    pub fn bundle_name(&self) -> &str {
+        match self {
+            BundleData::HostDirectory(bundle_path) => {
+                bundle_path.file_stem().unwrap().to_str().unwrap()
+            }
+            BundleData::Zip { bundle_path, .. } => bundle_path
+                .rsplit_once('/')
+                .unwrap()
+                .1
+                .strip_suffix(".app")
+                .unwrap(),
+        }
+    }
+
+    pub fn open_host_dir(path: &Path) -> Result<BundleData, String> {
+        Ok(BundleData::HostDirectory(path.to_path_buf()))
+    }
+
+    pub fn open_ipa(path: &Path) -> Result<BundleData, String> {
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("Could not open IPA file: {e}"))?;
+        let mut zip =
+            ZipArchive::new(file).map_err(|e| format!("Could not open IPA archive: {e}"))?;
+        let bundle_path = Self::find_bundle_path_in_archive(&mut zip)?;
+        Ok(BundleData::Zip { zip, bundle_path })
+    }
+
+    pub fn open_any(path: &Path) -> Result<BundleData, String> {
+        if path.is_file()
+            && path
+                .extension()
+                .map(|ext| ext.eq_ignore_ascii_case("ipa"))
+                .unwrap_or(false)
+        {
+            Ok(Self::open_ipa(path)?)
+        } else if path.is_dir() {
+            Ok(Self::open_host_dir(path)?)
+        } else {
+            Err(format!(
+                "{} is not a directory or an IPA file",
+                path.display()
+            ))
+        }
+    }
+
+    pub(super) fn into_fs_node(self) -> FsNode {
+        match self {
+            BundleData::HostDirectory(path) => FsNode::from_host_dir(&path, false),
+            BundleData::Zip { zip, bundle_path } => {
+                let archive = Rc::new(RefCell::new(zip));
+                let archive_cache = Rc::new(RefCell::new(ArchiveFileCache::default()));
+                let metadata_map = Rc::new(RefCell::new(HashMap::new()));
+
+                let mut archive_guard = (*archive).borrow_mut();
+
+                let mut builder = FsNodeBuilder::new();
+                for i in 0..archive_guard.len() {
+                    // Unreadable entries (e.g. with corrupt local file
+                    // headers) are skipped rather than causing a panic; the
+                    // rest of the bundle is still loaded. If a skipped entry
+                    // is actually needed later, `IpaFileRef::open()` will
+                    // return an empty file and log a warning.
+                    let (name, is_dir) = match archive_guard
+                        .by_index(i)
+                        .map(|file| (zip_entry_name(&file), file.is_dir()))
+                    {
+                        Ok(name_and_dir) => name_and_dir,
+                        Err(e) => {
+                            log!(
+                                "Warning: BundleData::into_fs_node(): skipping unreadable IPA archive entry #{}: {}",
+                                i,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    if let Some(path) = name.strip_prefix(&bundle_path) {
+                        let path = GuestPath::new(path);
+                        if is_dir {
+                            builder.add_directory(path);
+                        } else {
+                            builder.add_file(
+                                path,
+                                FsNode::bundle_zip_file(IpaFileRef {
+                                    archive: archive.clone(),
+                                    archive_files_cache: archive_cache.clone(),
+                                    metadata_map: metadata_map.clone(),
+                                    index: i,
+                                }),
+                            );
+                        }
+                    }
+                }
+                builder.build()
+            }
+        }
+    }
+
+    pub fn read_plist(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            BundleData::HostDirectory(path) => {
+                std::fs::read(path.join("Info.plist")).map_err(|e| {
+                    format!("Could not read Info.plist from the app bundle directory: {e}")
+                })
+            }
+            BundleData::Zip { zip, bundle_path } => {
+                // Look the entry up by our own decoding of the names (see
+                // zip_entry_name()) rather than with ZipArchive::by_name(),
+                // which only knows the CP437-decoded names.
+                let plist_path = format!("{bundle_path}/Info.plist");
+                let index = (0..zip.len())
+                    .find(|&i| {
+                        zip.by_index_raw(i)
+                            .is_ok_and(|file| zip_entry_name(&file) == plist_path)
+                    })
+                    .ok_or_else(|| {
+                        "Could not open Info.plist from the IPA archive: file not found".to_string()
+                    })?;
+                let mut file = zip
+                    .by_index(index)
+                    .map_err(|e| format!("Could not open Info.plist from the IPA archive: {e}"))?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf)
+                    .map_err(|e| format!("Could not read Info.plist from the IPA archive: {e}"))?;
+                Ok(buf)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArchivedFileMetadata {
+    /// Unix timestamp of file modification
+    last_modified: i64,
+    /// Uncompressed file size
+    size: u64,
+}
+
+const IPA_MEMORY_FILE_LIMIT: u64 = 1024 * 1024;
+const IPA_MEMORY_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+const IPA_CACHE_FILE_LIMIT: usize = 128;
+
+/// Large resources remain seekable without occupying anonymous memory for the
+/// entire session. The OS can reclaim disk-backed pages under memory pressure.
+#[derive(Debug)]
+enum DecompressedFile {
+    Memory(Vec<u8>),
+    Disk {
+        file: RefCell<std::fs::File>,
+        size: u64,
+    },
+}
+
+impl DecompressedFile {
+    fn size(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Disk { size, .. } => *size,
+        }
+    }
+
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Memory(bytes) => bytes.capacity(),
+            Self::Disk { .. } => 0,
+        }
+    }
+
+    fn read_entry(file: &mut zip::read::ZipFile) -> std::io::Result<Self> {
+        if file.size() <= IPA_MEMORY_FILE_LIMIT {
+            let mut bytes = Vec::with_capacity(file.size() as usize);
+            file.read_to_end(&mut bytes)?; // Includes ZIP CRC validation.
+            Ok(Self::Memory(bytes))
+        } else {
+            let mut spool = anonymous_archive_file()?;
+            let size = std::io::copy(file, &mut spool)?;
+            Ok(Self::Disk {
+                file: RefCell::new(spool),
+                size,
+            })
+        }
+    }
+}
+
+/// Anonymous scratch file: no stale extracted resources survive process death.
+fn anonymous_archive_file() -> std::io::Result<std::fs::File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let directory = crate::paths::user_data_base_path().join("touchHLE_ipa_cache");
+    std::fs::create_dir_all(&directory)?;
+    loop {
+        let path = directory.join(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // GENERIC_READ | GENERIC_WRITE | DELETE; FILE_FLAG_DELETE_ON_CLOSE.
+            options.access_mode(0xc0010000).custom_flags(0x04000100);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                std::fs::remove_file(&path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveFileCache {
+    files: HashMap<usize, (u64, Rc<DecompressedFile>)>,
+    clock: u64,
+    memory_bytes: usize,
+    budget: usize,
+}
+
+impl Default for ArchiveFileCache {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            clock: 0,
+            memory_bytes: 0,
+            budget: IPA_MEMORY_CACHE_BUDGET,
+        }
+    }
+}
+
+impl ArchiveFileCache {
+    fn get(&mut self, index: usize) -> Option<Rc<DecompressedFile>> {
+        let (used, data) = self.files.get_mut(&index)?;
+        self.clock = self.clock.wrapping_add(1);
+        *used = self.clock;
+        Some(Rc::clone(data))
+    }
+
+    fn insert(&mut self, index: usize, data: Rc<DecompressedFile>) {
+        self.clock = self.clock.wrapping_add(1);
+        self.memory_bytes += data.memory_size();
+        if let Some((_, old)) = self.files.insert(index, (self.clock, data)) {
+            self.memory_bytes -= old.memory_size();
+        }
+        while self.memory_bytes > self.budget || self.files.len() > IPA_CACHE_FILE_LIMIT {
+            let memory_pressure = self.memory_bytes > self.budget;
+            let oldest = self
+                .files
+                .iter()
+                .filter(|(_, (_, data))| !memory_pressure || data.memory_size() != 0)
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(&index, _)| index)
+                .unwrap();
+            let (_, removed) = self.files.remove(&oldest).unwrap();
+            self.memory_bytes -= removed.memory_size();
+        }
+    }
+}
+
+/// Represents a file inside an IPA bundle that can be opened.
+#[derive(Debug)]
+pub struct IpaFileRef {
+    archive: Rc<RefCell<ZipArchive<std::fs::File>>>,
+    archive_files_cache: Rc<RefCell<ArchiveFileCache>>,
+    metadata_map: Rc<RefCell<HashMap<usize, ArchivedFileMetadata>>>,
+    index: usize,
+}
+
+impl IpaFileRef {
+    pub fn open(&self) -> IpaFile {
+        if let Some(data) = self.archive_files_cache.borrow_mut().get(self.index) {
+            return IpaFile { data, position: 0 };
+        }
+        let data = {
+            // Read the zip entry into an owned buffer inside its own block so
+            // the `archive` RefMut is released before we touch the caches.
+            let mut archive = (*self.archive).borrow_mut();
+            let decoded: Option<(DecompressedFile, ArchivedFileMetadata)> = match archive
+                .by_index(self.index)
+            {
+                Ok(mut file) => {
+                    let modified = file.last_modified();
+                    // This is not the cleanest way!
+                    // TODO: just use `time` or `chrono` crates for time conversions
+                    // (this also entails a lot of refactoring in [crate::libc:time])
+                    let tm = tm::from(
+                        modified.year(),
+                        modified.month(),
+                        modified.day(),
+                        modified.hour(),
+                        modified.minute(),
+                        modified.second(),
+                    );
+                    let timestamp = calendar_date_to_timestamp(tm);
+                    let size = file.size();
+                    match DecompressedFile::read_entry(&mut file) {
+                        Err(e) => {
+                            // The central directory can be readable even when the
+                            // compressed payload is truncated or has a bad CRC.
+                            // Discarding a partial archive is safer than letting a
+                            // guest parse corrupted Unity/player data and continue
+                            // in a damaged state.
+                            log!(
+                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial data.",
+                            self.index,
+                            e
+                        );
+                            None
+                        }
+                        Ok(data) => Some((
+                            data,
+                            ArchivedFileMetadata {
+                                last_modified: timestamp.into(),
+                                size,
+                            },
+                        )),
+                    }
+                }
+                Err(ZipError::Io(e)) => {
+                    log!(
+                        "Warning: IpaFileRef::open(): IO error reading IPA entry {}: {}; returning empty file to guest.",
+                        self.index,
+                        e
+                    );
+                    None
+                }
+                Err(e) => {
+                    log!(
+                        "Warning: IpaFileRef::open(): could not open IPA entry {}: {}; returning empty file to guest.",
+                        self.index,
+                        e
+                    );
+                    None
+                }
+            };
+            drop(archive);
+
+            match decoded {
+                Some((buf, meta)) => {
+                    (*self.metadata_map)
+                        .borrow_mut()
+                        .entry(self.index)
+                        .or_insert(meta);
+                    Rc::new(buf)
+                }
+                None => {
+                    // Cache an explicit zero-size metadata record as well as
+                    // the empty data. This prevents repeated stat() probes of
+                    // the same bad ZIP entry from retrying decompression or
+                    // panicking on absent metadata.
+                    (*self.metadata_map)
+                        .borrow_mut()
+                        .entry(self.index)
+                        .or_insert(ArchivedFileMetadata {
+                            last_modified: 0,
+                            size: 0,
+                        });
+                    Rc::new(DecompressedFile::Memory(Vec::new()))
+                }
+            }
+        };
+        self.archive_files_cache
+            .borrow_mut()
+            .insert(self.index, Rc::clone(&data));
+        IpaFile { data, position: 0 }
+    }
+
+    pub fn get_last_modified(&self) -> time_t {
+        if !self.metadata_map.borrow().contains_key(&self.index) {
+            // This will force metadata loading. Broken ZIP entries cache
+            // explicit zero metadata, so a guest stat() remains safe.
+            _ = self.open();
+        }
+        let last_modified = {
+            self.metadata_map
+                .borrow()
+                .get(&self.index)
+                .map(|metadata| metadata.last_modified)
+        };
+        match last_modified {
+            Some(last_modified) => last_modified.try_into().unwrap_or(0),
+            None => {
+                log!(
+                    "Warning: IpaFileRef::get_last_modified(): IPA entry {} has \
+                     no readable metadata; reporting timestamp zero.",
+                    self.index
+                );
+                0
+            }
+        }
+    }
+    pub fn get_size(&self) -> u64 {
+        if !self.metadata_map.borrow().contains_key(&self.index) {
+            // See get_last_modified(): unreadable archive entries must remain
+            // visible as an empty/unusable guest file rather than panicking the
+            // emulator while probing their size.
+            _ = self.open();
+        }
+        let size = {
+            self.metadata_map
+                .borrow()
+                .get(&self.index)
+                .map(|metadata| metadata.size)
+        };
+        match size {
+            Some(size) => size,
+            None => {
+                log!(
+                    "Warning: IpaFileRef::get_size(): IPA entry {} has no readable \
+                     metadata; reporting size zero.",
+                    self.index
+                );
+                0
+            }
+        }
+    }
+}
+
+/// Represents an opened file in an IPA bundle.
+#[derive(Clone)]
+pub struct IpaFile {
+    data: Rc<DecompressedFile>,
+    position: u64,
+}
+
+impl Debug for IpaFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpaFile")
+            .field("size", &self.data.size())
+            .finish()
+    }
+}
+
+impl Read for IpaFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Match Cursor: any position beyond EOF reads zero bytes, including
+        // positions outside the host filesystem's signed seek range.
+        if buf.is_empty() || self.position >= self.data.size() {
+            return Ok(0);
+        }
+        let read = match self.data.as_ref() {
+            DecompressedFile::Memory(bytes) => {
+                let start = self.position as usize;
+                let count = buf.len().min(bytes.len() - start);
+                buf[..count].copy_from_slice(&bytes[start..start + count]);
+                count
+            }
+            DecompressedFile::Disk { file, .. } => {
+                let mut file = file.borrow_mut();
+                file.seek(SeekFrom::Start(self.position))?;
+                file.read(buf)?
+            }
+        };
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for IpaFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = match pos {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::End(offset) => self.data.size().checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid IPA file seek")
+        })?;
+        self.position = position;
+        Ok(position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::FileLocation;
+    use std::io::{Read, Write};
+
+    fn cache_test_bundle(entries: &[(&str, &[u8])], stored: bool) -> (FsNode, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "touchHLE_archive_cache_{}_{}.ipa",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let method = if stored {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        };
+        let options = zip::write::FileOptions::default().compression_method(method);
+        for (name, bytes) in entries {
+            zip.start_file(format!("Payload/TestApp.app/{name}"), options)
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        (BundleData::open_ipa(&path).unwrap().into_fs_node(), path)
+    }
+
+    fn cached_file<'a>(node: &'a FsNode, name: &str) -> &'a IpaFileRef {
+        let FsNode::Directory { children, .. } = node else {
+            panic!("not a directory")
+        };
+        let FsNode::File {
+            location: FileLocation::IpaFileRef(file),
+            ..
+        } = &children[name]
+        else {
+            panic!("not an archived file")
+        };
+        file
+    }
+
+    #[test]
+    fn large_ipa_resource_is_disk_backed_with_independent_seek_positions() {
+        let data: Vec<u8> = (0..IPA_MEMORY_FILE_LIMIT as usize + 257)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (node, path) = cache_test_bundle(&[("large.bin", &data)], false);
+        let entry = cached_file(&node, "large.bin");
+        let mut first = entry.open();
+        assert!(matches!(first.data.as_ref(), DecompressedFile::Disk { .. }));
+        assert_eq!(entry.get_size(), data.len() as u64);
+        first.seek(SeekFrom::Start(12345)).unwrap();
+        let mut duplicate = first.clone();
+        let mut separate = entry.open();
+        assert!(Rc::ptr_eq(&first.data, &separate.data));
+        let mut bytes = [0; 97];
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[12345..12345 + 97]);
+        separate.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[..97]);
+        duplicate.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[12345..12345 + 97]);
+        first.seek(SeekFrom::End(-97)).unwrap();
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[data.len() - 97..]);
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        let end = first.stream_position().unwrap();
+        assert!(first.seek(SeekFrom::Current(-(end as i64) - 1)).is_err());
+        assert_eq!(first.stream_position().unwrap(), end);
+        first.seek(SeekFrom::Start(u64::MAX)).unwrap();
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        drop((first, duplicate, separate, node));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ipa_memory_cache_is_bounded_without_invalidating_open_files() {
+        let data = vec![0x5a; 4096];
+        let (node, path) = cache_test_bundle(
+            &[("a", &data), ("b", &data), ("c", &data), ("d", &data)],
+            false,
+        );
+        let first = cached_file(&node, "a");
+        first.archive_files_cache.borrow_mut().budget = data.len() * 2;
+        let mut held = first.open();
+        for name in ["b", "c", "d"] {
+            cached_file(&node, name).open();
+        }
+        {
+            let cache = first.archive_files_cache.borrow();
+            assert!(cache.memory_bytes <= data.len() * 2);
+            assert!(!cache.files.contains_key(&first.index));
+        }
+        let mut actual = Vec::new();
+        held.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, data);
+        actual.clear();
+        first.open().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, data);
+        drop((held, node));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_large_ipa_resource_rejects_partial_disk_backing() {
+        let data = vec![0x42; IPA_MEMORY_FILE_LIMIT as usize + 17];
+        let (node, path) = cache_test_bundle(&[("large.bin", &data)], true);
+        drop(node);
+        let start = {
+            let mut archive = ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let start = archive.by_index(0).unwrap().data_start();
+            start
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[start as usize] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        let node = BundleData::open_ipa(&path).unwrap().into_fs_node();
+        let entry = cached_file(&node, "large.bin");
+        assert_eq!(entry.get_size(), 0);
+        assert_eq!(entry.get_last_modified(), 0);
+        let mut actual = Vec::new();
+        entry.open().read_to_end(&mut actual).unwrap();
+        assert!(actual.is_empty());
+        drop(node);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Regression test: IPAs with entries whose local file header is corrupt
+    /// used to cause a panic (`InvalidArchive("Invalid local file header")`)
+    /// when the bundle was loaded. Now such entries are skipped instead.
+    #[test]
+    fn test_ipa_with_corrupt_local_file_header() {
+        let dir = std::env::temp_dir().join("touchHLE_test_corrupt_ipa");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ipa_path = dir.join("TestApp.ipa");
+
+        // Build a minimal IPA.
+        let file = std::fs::File::create(&ipa_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        zip.start_file("Payload/TestApp.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"plist").unwrap();
+        zip.start_file("Payload/TestApp.app/broken.bin", options)
+            .unwrap();
+        zip.write_all(b"data").unwrap();
+        zip.finish().unwrap();
+
+        // Corrupt the local file header of the second entry (keep the
+        // central directory intact), mimicking IPAs found in the wild.
+        {
+            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
+            let header_start = zip.by_index(1).unwrap().header_start();
+            drop(zip);
+            let mut data = std::fs::read(&ipa_path).unwrap();
+            let start = header_start as usize;
+            data[start..start + 4].copy_from_slice(b"XXXX");
+            std::fs::write(&ipa_path, data).unwrap();
+        }
+
+        // Opening the IPA must succeed ...
+        let mut bundle = BundleData::open_any(&ipa_path).unwrap();
+        assert_eq!(bundle.bundle_name(), "TestApp");
+        // ... reading the plist must work ...
+        assert_eq!(bundle.read_plist().unwrap(), b"plist");
+        // ... and building the filesystem node must not panic; the broken
+        // entry is skipped, the valid one is still present.
+        let node = bundle.into_fs_node();
+        let FsNode::Directory { children, .. } = &node else {
+            panic!("expected directory");
+        };
+        assert!(children.contains_key("Info.plist"));
+        assert!(!children.contains_key("broken.bin"));
+    }
+
+    /// Many IPAs store UTF-8 entry names without setting the zip UTF-8 flag.
+    /// Those names must not be decoded as CP437, or a non-ASCII bundle name
+    /// (e.g. Arabic) stops matching the executable name from Info.plist.
+    #[test]
+    fn test_ipa_with_unflagged_utf8_names() {
+        let dir = std::env::temp_dir().join("touchHLE_test_unflagged_utf8_ipa");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ipa_path = dir.join("TestApp.ipa");
+
+        let app = "الابراج الفلكية";
+        let file = std::fs::File::create(&ipa_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("Payload/{app}.app/Info.plist"), options)
+            .unwrap();
+        zip.write_all(b"plist").unwrap();
+        zip.start_file(format!("Payload/{app}.app/{app}"), options)
+            .unwrap();
+        zip.write_all(b"exec").unwrap();
+        zip.finish().unwrap();
+
+        // The writer sets the UTF-8 flag (bit 11) for these names; clear it in
+        // every local file header and central directory header.
+        let mut bytes = std::fs::read(&ipa_path).unwrap();
+        for i in 0..bytes.len().saturating_sub(10) {
+            let flags_offset = match &bytes[i..i + 4] {
+                b"PK\x03\x04" => 6,
+                b"PK\x01\x02" => 8,
+                _ => continue,
+            };
+            bytes[i + flags_offset + 1] &= !0x08;
+        }
+        std::fs::write(&ipa_path, bytes).unwrap();
+        {
+            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
+            // Sanity check: the zip crate itself now sees CP437 mojibake.
+            assert_ne!(
+                zip.by_index(0).unwrap().name(),
+                format!("Payload/{app}.app/Info.plist")
+            );
+        }
+
+        let mut bundle = BundleData::open_any(&ipa_path).unwrap();
+        assert_eq!(bundle.bundle_name(), app);
+        assert_eq!(bundle.read_plist().unwrap(), b"plist");
+        let node = bundle.into_fs_node();
+        let FsNode::Directory { children, .. } = &node else {
+            panic!("expected directory");
+        };
+        assert!(children.contains_key("Info.plist"));
+        assert!(children.contains_key(app));
+    }
+
+    /// A central-directory entry can be listed successfully but fail its CRC
+    /// while decompressing. Its metadata queries must report the safe empty
+    /// representation rather than panicking the emulator.
+    #[test]
+    fn test_ipa_with_corrupt_payload_is_empty_not_panic() {
+        let dir = std::env::temp_dir().join("touchHLE_test_corrupt_ipa_payload");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ipa_path = dir.join("TestApp.ipa");
+
+        let file = std::fs::File::create(&ipa_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("Payload/TestApp.app/Info.plist", options)
+            .unwrap();
+        zip.write_all(b"plist").unwrap();
+        zip.start_file("Payload/TestApp.app/Data/data.unity3d", options)
+            .unwrap();
+        zip.write_all(b"player-data").unwrap();
+        zip.finish().unwrap();
+
+        // Alter stored payload bytes but retain the local header and central
+        // directory. `by_index` can still find this entry; read_to_end checks
+        // its CRC and reports an error.
+        let data_start = {
+            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
+            let data_start = zip.by_index(1).unwrap().data_start();
+            data_start
+        };
+        let mut bytes = std::fs::read(&ipa_path).unwrap();
+        bytes[data_start as usize] ^= 0xff;
+        std::fs::write(&ipa_path, bytes).unwrap();
+
+        let bundle = BundleData::open_any(&ipa_path).unwrap();
+        let node = bundle.into_fs_node();
+        let FsNode::Directory { children, .. } = &node else {
+            panic!("expected bundle directory");
+        };
+        let FsNode::Directory { children, .. } = children.get("Data").unwrap() else {
+            panic!("expected Data directory");
+        };
+        let FsNode::File {
+            location: FileLocation::IpaFileRef(file_ref),
+            ..
+        } = children.get("data.unity3d").unwrap()
+        else {
+            panic!("expected IPA player archive");
+        };
+
+        assert_eq!(file_ref.get_size(), 0);
+        assert_eq!(file_ref.get_last_modified(), 0);
+        let mut contents = Vec::new();
+        file_ref.open().read_to_end(&mut contents).unwrap();
+        assert!(contents.is_empty());
+    }
+}

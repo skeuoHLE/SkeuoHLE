@@ -1,0 +1,419 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! `UIScreen`.
+
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
+use crate::frameworks::foundation::NSInteger;
+use crate::objc::{
+    autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject,
+    TrivialHostObject, SEL,
+};
+
+#[derive(Default)]
+pub struct State {
+    main_screen: Option<id>,
+    current_mode: Option<id>,
+    /// `-brightness`, clamped to the documented 0.0-1.0 range.
+    brightness: CGFloat,
+    /// `-wantsSoftwareDimming`.
+    wants_software_dimming: bool,
+}
+
+/// Return the main screen's physical pixel size in fixed portrait coordinates.
+/// UIKit `bounds` is expressed in logical points; `nativeBounds` and
+/// `UIScreenMode.size` are expressed in pixels.
+fn native_pixel_size(env: &mut crate::Environment) -> CGSize {
+    let (width, height) = env.window().screen_size();
+    let scale = env.window().screen_scale() as CGFloat;
+    native_pixel_size_from_points((width, height), scale)
+}
+
+fn native_pixel_size_from_points((width, height): (u32, u32), scale: CGFloat) -> CGSize {
+    CGSize {
+        width: width as CGFloat * scale,
+        height: height as CGFloat * scale,
+    }
+}
+
+fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
+    // Use the window's effective screen size, which honours a custom resolution
+    // set via `--screen-size=WxH` or `--device-family=auto` (`host_screen_size`)
+    // and otherwise falls back to the selected device family's fixed point size.
+    // Previously this read `device_family().portrait_size()` directly, so a
+    // custom/auto resolution was stored but never actually exposed to the guest
+    // — the app kept rendering at the device's native point size.
+    env.window().screen_coordinate_size()
+}
+
+/// Per Apple documentation for `-setBrightness:`, values are clamped to the
+/// documented 0.0-1.0 range by the setter below.
+fn clamp_brightness(value: CGFloat) -> CGFloat {
+    if value < 0.0 {
+        0.0
+    } else if value > 1.0 {
+        1.0
+    } else {
+        value
+    }
+}
+
+const UI_USER_INTERFACE_IDIOM_PHONE: NSInteger = 0;
+const UI_USER_INTERFACE_IDIOM_PAD: NSInteger = 1;
+const UI_USER_INTERFACE_SIZE_CLASS_COMPACT: NSInteger = 1;
+const UI_USER_INTERFACE_SIZE_CLASS_REGULAR: NSInteger = 2;
+const UI_FORCE_TOUCH_CAPABILITY_UNAVAILABLE: NSInteger = 1;
+
+#[derive(Default)]
+struct UITraitCollectionHostObject {
+    user_interface_idiom: NSInteger,
+    horizontal_size_class: NSInteger,
+    vertical_size_class: NSInteger,
+    display_scale: CGFloat,
+}
+impl HostObject for UITraitCollectionHostObject {}
+
+fn screen_trait_values(env: &mut crate::Environment) -> (NSInteger, NSInteger, NSInteger, CGFloat) {
+    if env.window.is_none() {
+        return (
+            UI_USER_INTERFACE_IDIOM_PHONE,
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+            1.0,
+        );
+    }
+    let idiom = if env.window().device_family().is_ipad() {
+        UI_USER_INTERFACE_IDIOM_PAD
+    } else {
+        UI_USER_INTERFACE_IDIOM_PHONE
+    };
+    let landscape = matches!(
+        env.window().current_rotation(),
+        crate::window::DeviceOrientation::LandscapeLeft
+            | crate::window::DeviceOrientation::LandscapeRight
+    );
+    let (horizontal, vertical) = if idiom == UI_USER_INTERFACE_IDIOM_PAD {
+        (
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+        )
+    } else if landscape {
+        (
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+        )
+    } else {
+        (
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+        )
+    };
+    (
+        idiom,
+        horizontal,
+        vertical,
+        env.window().screen_scale() as CGFloat,
+    )
+}
+
+fn new_trait_collection(
+    env: &mut crate::Environment,
+    user_interface_idiom: NSInteger,
+    horizontal_size_class: NSInteger,
+    vertical_size_class: NSInteger,
+    display_scale: CGFloat,
+) -> id {
+    let class = env.objc.get_known_class("UITraitCollection", &mut env.mem);
+    let collection = env.objc.alloc_object(
+        class,
+        Box::new(UITraitCollectionHostObject {
+            user_interface_idiom,
+            horizontal_size_class,
+            vertical_size_class,
+            display_scale,
+        }),
+        &mut env.mem,
+    );
+    autorelease(env, collection)
+}
+
+pub const CLASSES: ClassExports = objc_classes! {
+
+(env, this, _cmd);
+
+@implementation UIScreen: NSObject
+
+// MARK: - Singleton
+
++ (id)mainScreen {
+    if let Some(screen) = env.framework_state.uikit.ui_screen.main_screen {
+        screen
+    } else {
+        let new = env.objc.alloc_static_object(
+            this,
+            Box::new(TrivialHostObject),
+            &mut env.mem,
+        );
+        env.framework_state.uikit.ui_screen.main_screen = Some(new);
+        new
+    }
+}
+
++ (id)screens {
+    // Only one screen is ever available.
+    let main: id = msg![env; this mainScreen];
+    msg_class![env; NSArray arrayWithObject:main]
+}
+
+// MARK: - Retain / release (singleton — no-ops)
+
+- (id)retain      { this }
+- (())release     {}
+- (id)autorelease { this }
+
+// MARK: - Geometry
+
+- (id)traitCollection {
+    let (idiom, horizontal, vertical, scale) = screen_trait_values(env);
+    new_trait_collection(env, idiom, horizontal, vertical, scale)
+}
+
+- (CGRect)bounds {
+    let (width, height) = screen_size_for_current_orientation(env);
+    if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
+        log!(
+            "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
+            width,
+            height
+        );
+    }
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width:  width  as CGFloat,
+            height: height as CGFloat,
+        },
+    }
+}
+
+- (CGRect)nativeBounds {
+    // Physical pixels stay portrait-up even when logical bounds rotate.
+    // https://developer.apple.com/documentation/uikit/uiscreen/nativebounds
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: native_pixel_size(env),
+    }
+}
+
+- (CGRect)applicationFrame {
+    let mut bounds: CGRect = msg![env; this bounds];
+    const STATUS_BAR_HEIGHT: CGFloat = 20.0;
+    if !env.framework_state.uikit.ui_application.status_bar_hidden {
+        bounds.origin.y    += STATUS_BAR_HEIGHT;
+        bounds.size.height -= STATUS_BAR_HEIGHT;
+    }
+    bounds
+}
+
+// MARK: - Scale
+
+- (CGFloat)scale {
+    env.window.as_ref().map_or(1.0, |window| window.screen_scale() as CGFloat)
+}
+
+- (CGFloat)nativeScale {
+    // On real iOS devices nativeScale equals scale (the point-to-pixel
+    // ratio of the physical display). Games use it to detect Retina and
+    // size their framebuffers; reporting 1.0 while `scale` reports 2.0
+    // made such games allocate a half-resolution framebuffer and draw
+    // zoomed / cropped.
+    env.window().screen_scale() as CGFloat
+}
+
+// MARK: - Brightness
+
+- (CGFloat)brightness {
+    env.framework_state.uikit.ui_screen.brightness
+}
+
+- (())setBrightness:(CGFloat)brightness {
+    // Per Apple documentation, brightness is in the range 0.0 (darkest)
+    // to 1.0 (lightest); clamp out-of-range values like the real UIKit.
+    let clamped = clamp_brightness(brightness);
+    if clamped != env.framework_state.uikit.ui_screen.brightness {
+        log!(
+            "[UIScreen setBrightness:] {} -> {} (host display unaffected)",
+            env.framework_state.uikit.ui_screen.brightness,
+            clamped
+        );
+        env.framework_state.uikit.ui_screen.brightness = clamped;
+    }
+}
+
+- (bool)wantsSoftwareDimming {
+    env.framework_state.uikit.ui_screen.wants_software_dimming
+}
+
+- (())setWantsSoftwareDimming:(bool)value {
+    // Per Apple documentation this only selects whether brightness changes
+    // are implemented by dimming; store the preference.
+    env.framework_state.uikit.ui_screen.wants_software_dimming = value;
+}
+
+// MARK: - Display mode / overscan
+
+- (id)currentMode {
+    // The underlying display buffer's pixels, independent of the logical
+    // interface-oriented drawing space exposed by bounds.
+    // https://developer.apple.com/documentation/uikit/uiscreenmode/size
+    let size = native_pixel_size(env);
+    crate::frameworks::uikit::ui_screen_mode::from_size(env, size, 1.0)
+}
+
+- (id)preferredMode {
+    nil
+}
+
+- (id)availableModes {
+    let current_mode: id = msg![env; this currentMode];
+    msg_class![env; NSArray arrayWithObject:current_mode]
+}
+
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/1617815-setcurrentmode>
+// (now deprecated, was originally on UIScreen but in iOS 5+ Apple moved
+// resolution control to UIScreenMode itself). The setter is documented as
+// a no-op on screens that have only a single supported mode, which is
+// the case for every device we emulate (a single fixed framebuffer).
+// Accept the call so apps that probe / try to set the mode at launch
+// don't get a "doesNotRecognizeSelector" log spam.
+- (())setCurrentMode:(id)_mode {
+    log_dbg!("[UIScreen setCurrentMode:] ignored; we emulate a single fixed display mode.");
+}
+
+- (CGFloat)overscanCompensationInsets {
+    // UIEdgeInsetsZero as four floats would need a custom return type.
+    // Return 0.0 as a stand-in; the real return type is UIEdgeInsets.
+    0.0
+}
+
+// MARK: - Mirroring (iOS 4.3+)
+
+- (id)mirroredScreen {
+    nil
+}
+
+- (bool)isCaptured {
+    false
+}
+
+// MARK: - Coordinate conversion helpers
+
+- (CGRect)convertRect:(CGRect)rect toScreen:(id)_other_screen {
+    // Single-screen device — coordinates are always the same.
+    rect
+}
+
+- (CGRect)convertRect:(CGRect)rect fromScreen:(id)_other_screen {
+    rect
+}
+
+- (CGPoint)convertPoint:(CGPoint)point toScreen:(id)_other_screen {
+    point
+}
+
+- (CGPoint)convertPoint:(CGPoint)point fromScreen:(id)_other_screen {
+    point
+}
+// MARK: - Display Link
+
+- (id)displayLinkWithTarget:(id)target selector:(SEL)selector {
+    msg_class![env; CADisplayLink displayLinkWithTarget:target selector:selector]
+}
+
+@end
+
+@implementation UITraitCollection: NSObject
+
++ (id)currentTraitCollection {
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    msg![env; screen traitCollection]
+}
+
++ (id)traitCollectionWithUserInterfaceIdiom:(NSInteger)idiom {
+    let (_, _, _, scale) = screen_trait_values(env);
+    let (horizontal, vertical) = if idiom == UI_USER_INTERFACE_IDIOM_PAD {
+        (UI_USER_INTERFACE_SIZE_CLASS_REGULAR, UI_USER_INTERFACE_SIZE_CLASS_REGULAR)
+    } else {
+        (UI_USER_INTERFACE_SIZE_CLASS_COMPACT, UI_USER_INTERFACE_SIZE_CLASS_REGULAR)
+    };
+    new_trait_collection(env, idiom, horizontal, vertical, scale)
+}
+
++ (id)traitCollectionWithHorizontalSizeClass:(NSInteger)horizontalSizeClass
+                            verticalSizeClass:(NSInteger)verticalSizeClass {
+    let (idiom, _, _, scale) = screen_trait_values(env);
+    new_trait_collection(env, idiom, horizontalSizeClass, verticalSizeClass, scale)
+}
+
++ (id)traitCollectionWithDisplayScale:(CGFloat)displayScale {
+    let (idiom, horizontal, vertical, _) = screen_trait_values(env);
+    new_trait_collection(env, idiom, horizontal, vertical, displayScale)
+}
+
+- (NSInteger)userInterfaceIdiom {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).user_interface_idiom
+}
+
+- (NSInteger)horizontalSizeClass {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).horizontal_size_class
+}
+
+- (NSInteger)verticalSizeClass {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).vertical_size_class
+}
+
+- (CGFloat)displayScale {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).display_scale
+}
+
+- (NSInteger)forceTouchCapability {
+    UI_FORCE_TOUCH_CAPABILITY_UNAVAILABLE
+}
+
+- (NSInteger)layoutDirection { 0 }
+
+@end
+
+};
+
+#[cfg(test)]
+mod tests {
+    use super::native_pixel_size_from_points;
+    use crate::frameworks::core_graphics::CGSize;
+    use crate::window::DeviceFamily;
+
+    #[test]
+    fn native_screen_pixels_use_fixed_portrait_dimensions_and_retina_scale() {
+        // Physical bounds never follow interface rotations.
+        // https://developer.apple.com/documentation/uikit/uiscreen/nativebounds
+        for family in [DeviceFamily::iPhone5, DeviceFamily::iPhone5c] {
+            assert_eq!(
+                native_pixel_size_from_points(family.portrait_size(), family.scale_factor()),
+                CGSize {
+                    width: 640.0,
+                    height: 1136.0
+                }
+            );
+        }
+        assert_eq!(
+            native_pixel_size_from_points((412, 915), 1.0),
+            CGSize {
+                width: 412.0,
+                height: 915.0
+            }
+        );
+    }
+}
