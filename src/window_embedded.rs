@@ -292,6 +292,12 @@ impl Window {
         // Lifecycle callbacks may keep drawing for up to a second; they must
         // use the pbuffer rather than a TextureView that is leaving the UI.
         self.sync_surface();
+        if self.drawable.0 > 0 && self.drawable.1 > 0 {
+            let oriented = size_for_orientation_from_size(self.screen_size(), self.device_orientation, NonZeroU32::new(1).unwrap());
+            if let Some(frame) = crate::embed::status_bar_frame(self.viewport(), self.drawable.1, oriented.1, self.screen_scale()) {
+                crate::embed::notify_status_bar_frame(frame);
+            }
+        }
         let parking = !self.blocked
             && !crate::embed::should_quit()
             && !crate::embed::is_runnable();

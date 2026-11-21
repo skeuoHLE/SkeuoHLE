@@ -21,6 +21,7 @@ use std::time::Duration;
 pub struct HostFns {
     pub orientation: fn(i32),
     pub status_bar_hidden: fn(bool),
+    pub status_bar_frame: fn(i32, i32, i32, i32),
     pub keyboard: fn(bool, &str),
     pub native_ui: Option<fn(&str) -> bool>,
     pub idle_timer: fn(bool),
@@ -44,6 +45,7 @@ fn noop_camera_start(_: bool, _: i32) -> bool { false }
 fn noop_camera_stop() {}
 fn noop_camera_frame() -> Option<Vec<u8>> { None }
 fn noop_bool(_: bool) {}
+fn noop_frame(_: i32, _: i32, _: i32, _: i32) {}
 fn noop_keyboard(_: bool, _: &str) {}
 fn noop_url(_: &str) -> bool {
     false
@@ -58,6 +60,7 @@ fn noop_crash(message: &str) {
 const NOOP_HOST: HostFns = HostFns {
     orientation: noop_i32,
     status_bar_hidden: noop_bool,
+    status_bar_frame: noop_frame,
     keyboard: noop_keyboard,
     native_ui: None,
     idle_timer: noop_bool,
@@ -1095,5 +1098,39 @@ mod tests {
             assert_eq!(options.preserve_aspect_ratio, !stretch);
             assert_eq!(options.network_access, stretch);
         }
+    }
+}
+
+
+/// Host pixels for UIKit's 20-point status bar, aligned with the rendered viewport.
+pub fn status_bar_frame(viewport: (u32, u32, u32, u32), drawable_height: u32,
+    guest_pixel_height: u32, guest_scale: f32) -> Option<(i32, i32, i32, i32)> {
+    let (x, y, width, height) = viewport;
+    if width == 0 || height == 0 || guest_pixel_height == 0 || !guest_scale.is_finite() || guest_scale <= 0.0 { return None; }
+    let bar = (height as f32 * 20.0 * guest_scale / guest_pixel_height as f32).round().max(1.0) as i32;
+    Some((x as i32, drawable_height as i32 - y as i32 - height as i32, width as i32, bar))
+}
+
+pub fn notify_status_bar_frame(frame: (i32, i32, i32, i32)) {
+    static LAST: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if *last == Some(frame) { return; }
+        *last = Some(frame);
+    }
+    let callback = host().lock().unwrap().status_bar_frame;
+    callback(frame.0, frame.1, frame.2, frame.3);
+}
+
+#[cfg(test)]
+mod status_bar_tests {
+    use super::*;
+    #[test]
+    fn aligns_status_bar_with_guest_viewport_and_retina_scale() {
+        assert_eq!(status_bar_frame((0, 480, 1440, 2160), 3120, 480, 1.0), Some((0, 480, 1440, 90)));
+        assert_eq!(status_bar_frame((0, 480, 1440, 2160), 3120, 960, 2.0), Some((0, 480, 1440, 90)));
+        assert_eq!(status_bar_frame((480, 0, 2160, 1440), 1440, 320, 1.0), Some((480, 0, 2160, 90)));
+        assert_eq!(status_bar_frame((0, 0, 1440, 3120), 3120, 480, 1.0), Some((0, 0, 1440, 130)));
+        assert_eq!(status_bar_frame((0, 0, 0, 0), 0, 480, 1.0), None);
     }
 }

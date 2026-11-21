@@ -45,6 +45,7 @@ struct Cache {
     class: *mut c_void,
     orientation: *mut c_void,
     status_bar: *mut c_void,
+    status_bar_frame: *mut c_void,
     keyboard: *mut c_void,
     native_ui: *mut c_void,
     idle_timer: *mut c_void,
@@ -214,6 +215,7 @@ fn ensure_cache(env: *mut c_void) -> Option<&'static Cache> {
         class,
         orientation: method("onRequestOrientation", "(I)V"),
         status_bar: method("onStatusBarHidden", "(Z)V"),
+        status_bar_frame: method("onStatusBarFrame", "(IIII)V"),
         keyboard: method("onKeyboard", "(ZLjava/lang/String;)V"),
         idle_timer: method("onIdleTimer", "(Z)V"),
         open_url: method("onOpenUrl", "(Ljava/lang/String;)Z"),
@@ -397,6 +399,12 @@ fn host_status_bar_on_java(hidden: bool) {
     );
 }
 
+fn host_status_bar_frame(x: i32, y: i32, width: i32, height: i32) {
+    let _ = touchHLE::android_jni::on_native_stack(move || {
+        call_void(|cache| cache.status_bar_frame, &[JValue { i: x }, JValue { i: y }, JValue { i: width }, JValue { i: height }]);
+    });
+}
+
 fn host_keyboard_on_java(show: bool, snapshot: &str) {
     let _ = with_env(|env| {
         let snapshot = java_string(env, snapshot);
@@ -497,6 +505,7 @@ fn install_host() {
     touchHLE::embed::set_host(touchHLE::embed::HostFns {
         orientation: host_orientation,
         status_bar_hidden: host_status_bar,
+        status_bar_frame: host_status_bar_frame,
         keyboard: host_keyboard,
         idle_timer: host_idle,
         open_url: host_open_url,
