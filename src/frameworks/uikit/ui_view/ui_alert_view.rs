@@ -57,7 +57,17 @@ pub const CLASSES: ClassExports = objc_classes! {
             message:(id)message
            delegate:(id)delegate
   cancelButtonTitle:(id)cancel_title
-  otherButtonTitles:(id)other_titles {
+  otherButtonTitles:(id)other_titles, ...args {
+    let mut titles = Vec::new();
+    if other_titles != nil {
+        titles.push(other_titles);
+        let mut remaining = args.start();
+        loop {
+            let title: id = remaining.next(env);
+            if title == nil { break; }
+            titles.push(title);
+        }
+    }
 
     // ВАЖНО: Вызов базового инициализатора для корректной регистрации объекта
     let this: id = msg_super![env; this init];
@@ -79,8 +89,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         let _: () = msg![env; buttons addObject:cancel_title];
         env.objc.borrow_mut::<UIAlertViewHostObject>(this).cancel_button_index = idx as NSInteger;
     }
-    if other_titles != nil {
-        let _: () = msg![env; buttons addObject:other_titles];
+    for title in titles {
+        let _: () = msg![env; buttons addObject:title];
     }
     let title_str = if title != nil { ns_string::to_rust_string(env, title).into_owned() } else { "(nil)".into() };
     let msg_str   = if message != nil { ns_string::to_rust_string(env, message).into_owned() } else { "(nil)".into() };
@@ -327,3 +337,35 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+
+#[cfg(test)]
+mod alert_button_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_every_variadic_alert_button() {
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let alert: id = msg_class![env; UIAlertView alloc];
+        let title = ns_string::get_static_str(env, "Warning");
+        let message = ns_string::get_static_str(env, "Choose");
+        let cancel = ns_string::get_static_str(env, "Cancel");
+        let first = ns_string::get_static_str(env, "First");
+        let second = ns_string::get_static_str(env, "Second");
+        let selector = env.objc.register_host_selector(
+            "initWithTitle:message:delegate:cancelButtonTitle:otherButtonTitles:".into(),
+            &mut env.mem,
+        );
+        let alert: id = crate::objc::msg_send_no_type_checking(
+            env, (alert, selector, title, message, nil, cancel, first, second, nil),
+        );
+        let count: NSUInteger = msg![env; alert numberOfButtons];
+        assert_eq!(count, 3);
+        let label: id = msg![env; alert buttonTitleAtIndex:2i32];
+        assert_eq!(ns_string::to_rust_string(env, label), "Second");
+        release(env, alert);
+        release(env, pool);
+    }
+}
