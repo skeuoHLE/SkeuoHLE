@@ -323,7 +323,31 @@ fn shutdown_backend() {
 }
 
 fn mic_thread() {
+    #[cfg(feature = "embedded")]
+    let mut parked = false;
     while THREAD_ALIVE.load(Ordering::Relaxed) {
+        #[cfg(feature = "embedded")]
+        {
+            let pause = crate::embed::is_paused();
+            if pause != parked {
+                // Embedded Android uses OpenAL capture. Stop the physical input
+                // while its guest is parked, preserving the guest's stream users.
+                if let Backend::OpenAL(dev) = &*lock(&BACKEND) {
+                    unsafe {
+                        if pause {
+                            openal::alcCaptureStop(dev.0);
+                        } else {
+                            openal::alcCaptureStart(dev.0);
+                        }
+                    }
+                }
+                parked = pause;
+            }
+            if parked {
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        }
         poll_once();
         std::thread::sleep(POLL_INTERVAL);
     }
