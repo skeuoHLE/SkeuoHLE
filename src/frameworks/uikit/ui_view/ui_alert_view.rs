@@ -269,6 +269,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     let btn_refs: Vec<&str> = btn_strings.iter().map(|s| s.as_str()).collect();
     let clicked = window::show_alert_dialog(env, &title_str, &message_str, &btn_refs);
 
+    // A host lifecycle cancellation must never select an ordinary button.
+    // https://developer.apple.com/documentation/uikit/uialertviewdelegate/alertviewcancel(_:)
+    if cfg!(feature = "embedded") && clicked < 0 && cancel_index < 0 {
+        env.objc.borrow_mut::<UIAlertViewHostObject>(this).visible = false;
+        let delegate = env.objc.borrow::<UIAlertViewHostObject>(this).delegate;
+        if delegate != nil {
+            if let Some(selector) = env.objc.lookup_selector("alertViewCancel:") {
+                let responds: bool = msg![env; delegate respondsToSelector:selector];
+                if responds { let _: () = msg![env; delegate alertViewCancel:this]; }
+            }
+        }
+        return;
+    }
+
     let dismiss_index = if clicked >= 0 && (clicked as NSUInteger) < btn_count {
         clicked as NSInteger
     } else if cancel_index >= 0 {

@@ -132,7 +132,8 @@ pub fn open_url(url: &str) -> bool {
 }
 
 pub fn alert(title: &str, message: &str, buttons: &[&str]) -> i32 {
-    (host().lock().unwrap().alert)(title, message, buttons)
+    let callback = host().lock().unwrap().alert;
+    callback(title, message, buttons)
 }
 
 pub fn report_crash(message: &str) {

@@ -329,7 +329,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let selected_action = ordered_actions
         .get(clicked as usize)
         .copied()
-        .or_else(|| ordered_actions.first().copied())
+        .or_else(|| {
+            if cfg!(feature = "embedded") {
+                (cancel_action != nil).then_some(cancel_action)
+            } else {
+                ordered_actions.first().copied()
+            }
+        })
         .unwrap_or(nil);
     let selected_action = if selected_action != nil {
         retain(env, selected_action)

@@ -217,7 +217,7 @@ fn ensure_cache(env: *mut c_void) -> Option<&'static Cache> {
         keyboard: method("onKeyboard", "(ZLjava/lang/String;)V"),
         idle_timer: method("onIdleTimer", "(Z)V"),
         open_url: method("onOpenUrl", "(Ljava/lang/String;)Z"),
-        alert: method("onAlert", "(Ljava/lang/String;Ljava/lang/String;)I"),
+        alert: method("onAlert", "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)I"),
         native_ui: method("onUIKitScreen", "(Ljava/lang/String;)Z"),
         crash: method("onCrash", "(Ljava/lang/String;)V"),
         photo_picker: method("onPickImage", "(I)Z"),
@@ -292,10 +292,11 @@ fn host_open_url(url: &str) -> bool {
     let url = url.to_owned();
     touchHLE::android_jni::on_native_stack(move || host_open_url_on_java(&url)).unwrap_or(false)
 }
-fn host_alert(title: &str, message: &str, _buttons: &[&str]) -> i32 {
+fn host_alert(title: &str, message: &str, buttons: &[&str]) -> i32 {
     let title = title.to_owned();
     let message = message.to_owned();
-    touchHLE::android_jni::on_native_stack(move || host_alert_on_java(&title, &message, &[])).unwrap_or(0)
+    let buttons: Vec<String> = buttons.iter().map(|text| (*text).to_owned()).collect();
+    touchHLE::android_jni::on_native_stack(move || host_alert_on_java(&title, &message, &buttons)).unwrap_or(-1)
 }
 fn host_crash(message: &str) {
     let message = message.to_owned();
@@ -436,32 +437,38 @@ fn host_open_url_on_java(url: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn host_alert_on_java(title: &str, message: &str, _buttons: &[&str]) -> i32 {
+fn host_alert_on_java(title: &str, message: &str, buttons: &[String]) -> i32 {
     with_env(|env| {
-        let Some(cache) = ensure_cache(env) else {
-            return 0;
-        };
-        if cache.alert.is_null() {
-            return 0;
+        let cache = ensure_cache(env)?;
+        if cache.alert.is_null() { return None; }
+        let find: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void =
+            unsafe { touchHLE::android_jni::table_fn(env, FIND_CLASS)? };
+        let new_array: unsafe extern "C" fn(*mut c_void, c_int, *mut c_void, *mut c_void) -> *mut c_void =
+            unsafe { touchHLE::android_jni::table_fn(env, 172)? };
+        let set_element: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, *mut c_void) =
+            unsafe { touchHLE::android_jni::table_fn(env, 174)? };
+        let call: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> c_int =
+            unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_INT_METHOD_A)? };
+        let string_class = unsafe { find(env, c"java/lang/String".as_ptr()) };
+        if string_class.is_null() { clear_exception(env); return None; }
+        let labels = unsafe { new_array(env, buttons.len() as c_int, string_class, std::ptr::null_mut()) };
+        delete_local(env, string_class);
+        if labels.is_null() { clear_exception(env); return None; }
+        for (index, label) in buttons.iter().enumerate() {
+            let label = java_string(env, label);
+            unsafe { set_element(env, labels, index as c_int, label) };
+            delete_local(env, label);
         }
         let title = java_string(env, title);
         let message = java_string(env, message);
-        let args = [JValue { l: title }, JValue { l: message }];
-        let Some(call): Option<
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> c_int,
-        > = (unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_INT_METHOD_A) })
-        else {
-            delete_local(env, title);
-            delete_local(env, message);
-            return 0;
-        };
+        let args = [JValue { l: title }, JValue { l: message }, JValue { l: labels }];
         let result = unsafe { call(env, cache.class, cache.alert, args.as_ptr()) };
         delete_local(env, title);
         delete_local(env, message);
+        delete_local(env, labels);
         clear_exception(env);
-        result
-    })
-    .unwrap_or(0)
+        Some(result)
+    }).flatten().unwrap_or(-1)
 }
 
 fn host_crash_on_java(message: &str) {
